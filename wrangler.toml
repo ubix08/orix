@@ -39,7 +39,7 @@ GEMINI_API_KEY = "AIzaSyDxD7WiixJUVw6h0HWqW6lS8pHpVihnNTM"
 
 [[vectorize]]
 binding = "VECTORIZE" # available in your Worker on env.VECTORIZE
-index_name = "agent-memory-index"
+index_name = "memory-index"
 
 # -------------------------------------------------
 # Optional: Authentication secrets (set via wrangler secret put)
