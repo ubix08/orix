@@ -1,0 +1,41 @@
+{
+  "name": "Orion",
+  "version": "2.0.0",
+  "description": "Suna-like autonomous agent on Cloudflare Workers free-tier — real Python, POSIX workspace, zero external cost",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "start": "wrangler dev --local",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "check": "tsc --noEmit && wrangler deploy --dry-run",
+    "test": "vitest",
+    "format": "prettier --write ."
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "gemini",
+    "agent",
+    "pyodide",
+    "wasm",
+    "free-tier"
+  ],
+  "author": "Ubix",
+  "license": "MIT",
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.5",
+    "@cloudflare/vitest-pool-workers": "^0.9.12",
+    "@cloudflare/workers-types": "^4.20251008.0",
+    "@types/node": "^24.7.1",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3",
+    "vitest": "3.2.4",
+    "wrangler": "^4.42.2"
+  },
+  "dependencies": {
+    "@google/genai": "^1.28.0",
+    "zod": "^3.25.76"
+  }
+}

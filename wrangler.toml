@@ -1,0 +1,57 @@
+name = "orinx"
+main = "src/index.ts"
+compatibility_date = "2024-04-03"
+
+[assets]
+directory = "public"
+
+# -------------------------------------------------
+# Durable Object binding (required!)
+# -------------------------------------------------
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AutonomousAgent"
+
+# -------------------------------------------------
+# Tell Cloudflare that the class exists in the bundle
+# -------------------------------------------------
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AutonomousAgent"]
+
+# Increased CPU limit for complex agent operations (5 minutes)
+[durable_objects.limits]
+cpu_ms = 300000
+
+# -------------------------------------------------
+# D1 Database binding (NEW - for persistent storage)
+# -------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "orinx-db"
+database_id = "e6dc6bd2-63fc-47dc-9d69-b57ee2ef3621"
+
+# -------------------------------------------------
+# Environment Variables
+# -------------------------------------------------
+[vars]
+GEMINI_API_KEY = "AIzaSyDxD7WiixJUVw6h0HWqW6lS8pHpVihnNTM"
+
+[[vectorize]]
+binding = "VECTORIZE" # available in your Worker on env.VECTORIZE
+index_name = "agent-memory-index"
+
+# -------------------------------------------------
+# Optional: Authentication secrets (set via wrangler secret put)
+# Uncomment and set these for authentication:
+# -------------------------------------------------
+# To set secrets, run:
+# wrangler secret put JWT_SECRET
+# wrangler secret put ADMIN_GMAIL
+# wrangler secret put ADMIN_PASSWORD_HASH
+
+# -------------------------------------------------
+# Routes (optional - uncomment if you have a custom domain)
+# -------------------------------------------------
+#[[routes]]
+#pattern = "orinx.rachidhakim265-b4e.workers.dev/api/*"
