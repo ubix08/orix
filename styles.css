@@ -1,0 +1,155 @@
+/* Suna-Lite Custom Styles */
+body {
+font-family: 'Inter', sans-serif;
+background-color: #171717;
+}
+/* Custom Scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+width: 8px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+background: #171717;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+background: #4A4A4A;
+border-radius: 4px;
+border: 2px solid #171717;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+background: #6c6c6c;
+}
+/* Textarea No Resize */
+textarea {
+resize: none;
+}
+/* Tools Popup Animation */
+.tools-popup {
+transition: opacity 0.2s ease-in-out, transform 0.2s ease-in-out;
+}
+/* Bounce Animation for Typing Dots */
+@keyframes bounce {
+0%, 100% {
+transform: translateY(0);
+}
+50% {
+transform: translateY(-8px);
+}
+}
+.animate-bounce {
+animation: bounce 1.4s infinite;
+}
+/* Toast Animations */
+@keyframes slide-in {
+from {
+transform: translateX(100%);
+opacity: 0;
+}
+to {
+transform: translateX(0);
+opacity: 1;
+}
+}
+@keyframes slide-out {
+from {
+transform: translateX(0);
+opacity: 1;
+}
+to {
+transform: translateX(100%);
+opacity: 0;
+}
+}
+.animate-slide-in {
+animation: slide-in 0.3s forwards;
+}
+.animate-slide-out {
+animation: slide-out 0.3s forwards;
+}
+/* Markdown Content Styling */
+.message-content {
+line-height: 1.75;
+}
+.message-content p {
+margin-bottom: 1rem;
+}
+.message-content ul,
+.message-content ol {
+margin-top: 0.5rem;
+margin-bottom: 1rem;
+padding-left: 1.5rem;
+}
+.message-content ul li {
+list-style-type: disc;
+margin-bottom: 0.5rem;
+}
+.message-content ol li {
+list-style-type: decimal;
+margin-bottom: 0.5rem;
+}
+.message-content pre {
+background: #0d1117;
+padding: 1rem;
+border-radius: 0.5rem;
+overflow-x: auto;
+margin: 1rem 0;
+}
+.message-content code:not([class]) {
+background-color: rgba(255, 255, 255, 0.1);
+padding: 0.2em 0.4em;
+border-radius: 0.3rem;
+font-size: 85%;
+}
+.message-content h1,
+.message-content h2,
+.message-content h3 {
+font-weight: 600;
+margin-top: 1.5rem;
+margin-bottom: 0.75rem;
+}
+.message-content h1 {
+font-size: 1.875rem;
+}
+.message-content h2 {
+font-size: 1.5rem;
+}
+.message-content h3 {
+font-size: 1.25rem;
+}
+.message-content table {
+width: 100%;
+border-collapse: collapse;
+margin: 1rem 0;
+}
+.message-content table th,
+.message-content table td {
+border: 1px solid rgba(255, 255, 255, 0.1);
+padding: 0.5rem;
+text-align: left;
+}
+.message-content table th {
+background: rgba(255, 255, 255, 0.05);
+font-weight: 600;
+}
+/* Smooth Scrolling */
+html {
+scroll-behavior: smooth;
+}
+/* Focus Styles */
+button:focus-visible,
+textarea:focus-visible,
+input:focus-visible {
+outline: 2px solid #10a37f;
+outline-offset: 2px;
+}
+/* Loading Animation for Status Indicator */
+@keyframes pulse {
+0%, 100% {
+opacity: 1;
+}
+50% {
+opacity: 0.5;
+}
+}
+.animate-pulse {
+animation: pulse 1.5s infinite;
+}
