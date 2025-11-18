@@ -1,4 +1,4 @@
-// src/durable-agent.ts - Enhanced with Memory System and RPC Methods
+// src/durable-agent.ts - Enhanced with V2 Orchestration
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import type { Env, Message } from './types';
 import { Agent } from './agent-core';
@@ -7,6 +7,7 @@ import { GeminiClient } from './gemini';
 import { D1Manager } from './storage/d1-manager';
 import { MemoryManager } from './memory/memory-manager';
 import type { AgentConfig } from './agent-core';
+import type { ToolCall, ToolResult } from './tools/types';
 
 export class AutonomousAgent {
   private storage: DurableStorage;
@@ -21,11 +22,17 @@ export class AutonomousAgent {
   private flushScheduled = false;
   private memoryEnabled = true;
   private initialized = false;
+  
+  // NEW: Feature flag for V2 orchestration
+  private useV2Orchestration: boolean;
 
   constructor(state: DurableObjectState, env: Env) {
     this.env = env;
     this.storage = new DurableStorage(state);
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
+
+    // NEW: Read feature flag from environment
+    this.useV2Orchestration = env.ENABLE_V2_ORCHESTRATION === 'true';
 
     if (env.DB) {
       this.d1 = new D1Manager(env.DB);
@@ -43,6 +50,7 @@ export class AutonomousAgent {
       useCodeExecution: true,
       useMapsGrounding: false,
       useVision: false,
+      useV2Orchestration: this.useV2Orchestration,
     };
 
     this.agent = new Agent(this.gemini, config);
@@ -68,6 +76,9 @@ export class AutonomousAgent {
           ltmThreshold: 0.65,
         }
       );
+      
+      // Set memory in agent
+      this.agent.setMemory(this.memory);
       console.log('[DurableAgent] Memory system initialized');
     }
 
@@ -92,15 +103,242 @@ export class AutonomousAgent {
     return new Response('Not Found', { status: 404 });
   }
 
-  // RPC Methods for HTTP endpoints
+  // =============================================================
+  // 🔥 NEW V2: RPC Method with Orchestration
+  // =============================================================
 
   public async handleChat(message: string): Promise<{ response: string }> {
     await this.init();
-    const finalResponse = await this.processFullMessage(message);
-    return { response: finalResponse };
+    
+    if (this.useV2Orchestration) {
+      console.log('[DurableAgent] Using V2 orchestration');
+      const finalResponse = await this.processMessageV2(message, null);
+      return { response: finalResponse };
+    } else {
+      console.log('[DurableAgent] Using V1 orchestration (legacy)');
+      const finalResponse = await this.processMessageV1(message);
+      return { response: finalResponse };
+    }
   }
 
-  private async processFullMessage(userMsg: string): Promise<string> {
+  // =============================================================
+  // ✨ NEW V2: DO-Based Multi-Turn Orchestration
+  // =============================================================
+
+  private async processMessageV2(
+    userMsg: string,
+    ws: WebSocket | null
+  ): Promise<string> {
+    return this.storage.withTransaction(async (state) => {
+      state.lastActivityAt = Date.now();
+
+      // 1. Save user message
+      await this.storage.saveMessage('user', [{ text: userMsg }]);
+      const userRecord: Message = {
+        role: 'user',
+        parts: [{ text: userMsg }],
+        timestamp: Date.now(),
+      };
+      this.pendingFlush.push(userRecord);
+
+      // 2. Save to vector memory
+      if (this.memory) {
+        await this.saveToMemory('user', userMsg);
+      }
+
+      // 3. Build memory context once at start
+      let memoryContext = '';
+      let cachedResponse: string | null = null;
+      
+      if (this.memory) {
+        ws && this.send(ws, { 
+          type: 'status', 
+          message: 'Searching memory for relevant context...' 
+        });
+        
+        try {
+          const memoryResult = await this.memory.buildEnhancedContext(userMsg, undefined, {
+            includeSTM: true,
+            includeLTM: true,
+            maxSTMResults: 5,
+            maxLTMResults: 3,
+          });
+          
+          memoryContext = memoryResult.context;
+          
+          // Check for high-similarity cached response (>90%)
+          if (memoryResult.hasHighSimilarity) {
+            const ltmResults = await this.memory.searchLongTermMemory(userMsg, 1);
+            if (ltmResults.length > 0 && ltmResults[0].score >= 0.9) {
+              cachedResponse = ltmResults[0].metadata?.answer;
+              if (cachedResponse) {
+                ws && this.send(ws, {
+                  type: 'status',
+                  message: `Found highly similar past query (${(ltmResults[0].score * 100).toFixed(1)}% match)`,
+                });
+              }
+            }
+          }
+        } catch (error) {
+          console.error('[DurableAgent] Memory context building failed:', error);
+        }
+      }
+
+      // 4. Early exit for cached responses
+      if (cachedResponse) {
+        const response = `[Based on similar past query]\n\n${cachedResponse}`;
+        
+        // Stream cached response
+        if (ws) {
+          const words = response.split(' ');
+          for (const word of words) {
+            this.send(ws, { type: 'chunk', content: word + ' ' });
+            await new Promise(r => setTimeout(r, 10));
+          }
+        }
+
+        // Save and flush
+        await this.storage.saveMessage('model', [{ text: response }]);
+        this.pendingFlush.push({
+          role: 'model',
+          parts: [{ text: response }],
+          timestamp: Date.now(),
+        });
+        await this.flushPendingToD1();
+        
+        // Update LTM stats
+        if (this.memory) {
+          const ltmResults = await this.memory.searchLongTermMemory(userMsg, 1);
+          if (ltmResults[0]?.metadata?.id) {
+            await this.memory.updateLongTermMemory({
+              ...ltmResults[0].metadata,
+              lastAccessed: Date.now(),
+              interactions: (ltmResults[0].metadata.interactions || 0) + 1,
+            });
+          }
+        }
+
+        ws && this.send(ws, { type: 'complete', response });
+        return response;
+      }
+
+      // 5. Multi-turn orchestration loop
+      let fullResponse = '';
+      let completed = false;
+      let turnCount = 0;
+      const MAX_TURNS = this.agent.getConfig().maxTurns;
+
+      while (!completed && turnCount < MAX_TURNS) {
+        turnCount++;
+        ws && this.send(ws, {
+          type: 'status',
+          message: `Turn ${turnCount}/${MAX_TURNS} | Reasoning...`,
+        });
+
+        // 5a. Get fresh conversation history
+        const history = this.storage.getMessages();
+
+        // 5b. Execute single reasoning step via Agent
+        try {
+          const step = await this.agent.run_step_v2(history, {
+            memoryContext,
+            model: this.agent.getConfig().model,
+            temperature: this.agent.getConfig().temperature,
+            files: state.context?.files ?? [],
+            onChunk: (chunk) => {
+              fullResponse += chunk;
+              ws && this.send(ws, { type: 'chunk', content: chunk });
+            },
+            onStatus: (status) => {
+              ws && this.send(ws, { type: 'status', message: status });
+            },
+          });
+
+          // 5c. Save assistant message immediately (per-turn checkpointing)
+          await this.storage.saveMessage('model', [{ text: step.text }]);
+          const modelRecord: Message = {
+            role: 'model',
+            parts: [{ text: step.text }],
+            timestamp: Date.now(),
+          };
+          this.pendingFlush.push(modelRecord);
+
+          // 5d. Save to memory
+          if (this.memory) {
+            await this.saveToMemory('model', step.text);
+          }
+
+          // 5e. Handle tool calls
+          if (step.toolCalls && step.toolCalls.length > 0) {
+            ws && this.send(ws, {
+              type: 'tool_use',
+              tools: step.toolCalls.map(t => t.name),
+            });
+
+            // Execute tools with proper state
+            const results = await this.executeToolsV2(step.toolCalls, state);
+
+            // Format and save observations
+            const observations = this.formatToolResults(results);
+            await this.storage.saveMessage('user', [{ text: observations }]);
+            
+            const observationRecord: Message = {
+              role: 'user',
+              parts: [{ text: observations }],
+              timestamp: Date.now(),
+            };
+            this.pendingFlush.push(observationRecord);
+
+            // Save observations to memory
+            if (this.memory) {
+              await this.saveToMemory('model', observations);
+            }
+
+            // Continue to next turn
+            completed = false;
+          } else {
+            // No tool calls = agent is done
+            completed = true;
+          }
+
+          // 5f. Flush to D1 after each turn (crash recovery)
+          await this.flushPendingToD1();
+
+        } catch (error) {
+          console.error('[DurableAgent] Turn error:', error);
+          ws && this.send(ws, { type: 'error', error: String(error) });
+          throw error;
+        }
+      }
+
+      // 6. Post-conversation tasks
+      if (!completed) {
+        ws && this.send(ws, {
+          type: 'status',
+          message: 'Max turns reached - providing partial response',
+        });
+      }
+
+      // 7. Create LTM summary if significant session
+      const history = this.storage.getMessages();
+      if (this.memory && history.length > 0 && history.length % 15 === 0) {
+        ws && this.send(ws, {
+          type: 'status',
+          message: 'Creating long-term memory summary...',
+        });
+        await this.maybeCreateLTM(history, userMsg, fullResponse);
+      }
+
+      ws && this.send(ws, { type: 'complete', response: fullResponse });
+      return fullResponse;
+    });
+  }
+
+  // =============================================================
+  // 📜 LEGACY V1: Original Orchestration (Backward Compatible)
+  // =============================================================
+
+  private async processMessageV1(userMsg: string): Promise<string> {
     let finalResponse = '';
     await this.storage.withTransaction(async (state) => {
       state.lastActivityAt = Date.now();
@@ -121,108 +359,109 @@ export class AutonomousAgent {
 
       const history = this.storage.getMessages();
 
-      // 🧠 Check for high-similarity LTM
-      let shouldUseCachedResponse = false;
-      let cachedResponse = '';
-      
-      if (this.memory) {
-        try {
-          const memoryResult = await this.memory.buildEnhancedContext(userMsg, undefined, {
-            includeSTM: true,
-            includeLTM: true,
-            maxSTMResults: 5,
-            maxLTMResults: 3,
-          });
-          
-          if (memoryResult.hasHighSimilarity && memoryResult.similarQuery) {
-            const ltmResults = await this.memory.searchLongTermMemory(userMsg, 1);
-            if (ltmResults.length > 0 && ltmResults[0].score >= 0.9) {
-              const storedAnswer = ltmResults[0].metadata?.answer;
-              if (storedAnswer) {
-                shouldUseCachedResponse = true;
-                cachedResponse = storedAnswer;
-              }
-            }
+      // Use legacy Agent.run() method
+      try {
+        const result = await this.agent.run(
+          userMsg,
+          history,
+          state,
+          {
+            onStatus: (status) => console.log('[ProcessV1] ', status),
+            onToolUse: (tools) => console.log('[ProcessV1] Tool use:', tools),
           }
-        } catch (error) {
-          console.error('[DurableAgent] Memory context building failed:', error);
+        );
+        
+        finalResponse = result.response;
+
+        if (result.completed) {
+          await this.storage.saveMessage('model', [{ text: finalResponse }]);
+          const modelRecord: Message = {
+            role: 'model',
+            parts: [{ text: finalResponse }],
+            timestamp: Date.now(),
+          };
+          this.pendingFlush.push(modelRecord);
+
+          // Save assistant response to memory
+          if (this.memory) {
+            await this.saveToMemory('model', finalResponse);
+          }
+
+          await this.flushPendingToD1();
+
+          // Create long-term memory summary if session is significant
+          if (this.memory && history.length > 0 && history.length % 15 === 0) {
+            await this.maybeCreateLTM(history, userMsg, finalResponse);
+          }
         }
-      }
-
-      let completed = false;
-      
-      while (!completed) {
-        try {
-          if (shouldUseCachedResponse && cachedResponse) {
-            finalResponse = `[Based on similar past query]\n\n${cachedResponse}`;
-            completed = true;
-            
-            // Update LTM access stats
-            if (this.memory) {
-              const ltmResults = await this.memory.searchLongTermMemory(userMsg, 1);
-              if (ltmResults.length > 0 && ltmResults[0].metadata?.id) {
-                await this.memory.updateLongTermMemory({
-                  ...ltmResults[0].metadata,
-                  lastAccessed: Date.now(),
-                  interactions: (ltmResults[0].metadata.interactions || 0) + 1,
-                });
-              }
-            }
-          } else {
-            // Build memory context
-            let memoryContext = '';
-            if (this.memory) {
-              memoryContext = await this.memory.buildContext(userMsg);
-            }
-
-            const result = await this.agent.run(
-              userMsg,
-              history,
-              state,
-              {
-                onStatus: (status) => console.log('[Process] ', status),
-                onToolUse: (tools) => console.log('[Process] Tool use:', tools),
-              }
-            );
-            
-            finalResponse += result.response;
-            completed = result.completed;
-          }
-
-          if (completed) {
-            await this.storage.saveMessage('model', [{ text: finalResponse }]);
-            const modelRecord: Message = {
-              role: 'model',
-              parts: [{ text: finalResponse }],
-              timestamp: Date.now(),
-            };
-            this.pendingFlush.push(modelRecord);
-
-            // Save assistant response to memory
-            if (this.memory) {
-              await this.saveToMemory('model', finalResponse);
-            }
-
-            await this.flushPendingToD1();
-
-            // Create long-term memory summary if session is significant
-            if (this.memory && history.length > 0 && history.length % 15 === 0) {
-              await this.maybeCreateLTM(history, userMsg, finalResponse);
-            }
-          } else {
-            // Continue the loop for next reasoning step
-            console.log('[DurableAgent] Chaining next reasoning step...');
-            // Optionally save partial if needed
-          }
-        } catch (err) {
-          console.error('[DurableAgent] processFullMessage error:', err);
-          throw err;
-        }
+      } catch (err) {
+        console.error('[DurableAgent] processMessageV1 error:', err);
+        throw err;
       }
     });
 
     return finalResponse;
   }
+
+  // =============================================================
+  // 🔧 V2 Helper Methods
+  // =============================================================
+
+  /**
+   * V2: Tool execution with proper state access
+   */
+  private async executeToolsV2(
+    toolCalls: ToolCall[],
+    state: any
+  ): Promise<ToolResult[]> {
+    const settled = await Promise.allSettled(
+      toolCalls.map(async (call) => {
+        try {
+          // Get tool registry from agent
+          const tools = this.agent.getRegisteredTools();
+          const tool = tools.find(t => t.name === call.name);
+          
+          if (!tool) {
+            return {
+              name: call.name,
+              success: false,
+              result: `Tool '${call.name}' not found`,
+            } as ToolResult;
+          }
+
+          // Execute with full state context
+          return await tool.execute(call.args, {
+            ...state,
+            sessionId: this.sessionId,
+            memory: this.memory,
+          });
+        } catch (e) {
+          return {
+            name: call.name,
+            success: false,
+            result: `Execution failed: ${String(e)}`,
+          } as ToolResult;
+        }
+      })
+    );
+
+    return settled
+      .filter((r): r is PromiseFulfilledResult<ToolResult> => r.status === 'fulfilled')
+      .map(r => r.value);
+  }
+
+  /**
+   * Format tool results for conversation history
+   */
+  private formatToolResults(results: ToolResult[]): string {
+    return results
+      .map(r => `[Observation: ${r.name}] ${r.success ? '✅ Success' : '❌ Failed'}\n${r.result}`)
+      .join('\n\n');
+  }
+
+  // =============================================================
+  // 🔌 RPC Methods (Same for Both V1 and V2)
+  // =============================================================
 
   public async getHistory(): Promise<{ messages: Message[] }> {
     await this.init();
@@ -247,7 +486,6 @@ export class AutonomousAgent {
     const storageStatus = this.storage.getStatus();
     const config = this.agent.getConfig();
     const circuit = this.gemini.getCircuitBreakerStatus?.() || { healthy: true };
-    const doState = this.storage.getDurableObjectState();
 
     return {
       ...storageStatus,
@@ -256,10 +494,9 @@ export class AutonomousAgent {
         maxTurns: config.maxTurns,
         useSearch: config.useSearch,
         useCodeExecution: config.useCodeExecution,
-        note: 'Extended CPU limits configured for longer processing',
+        orchestrationVersion: this.useV2Orchestration ? 'V2' : 'V1 (Legacy)',
       },
       circuitBreaker: circuit,
-      cpuLimit: 'Up to 5 minutes per invocation with configuration',
       d1Status: {
         enabled: !!this.d1,
         sessionId: this.sessionId || null,
@@ -327,6 +564,10 @@ export class AutonomousAgent {
     return { summary, topics };
   }
 
+  // =============================================================
+  // 🌐 WebSocket Handler (Works with Both V1 and V2)
+  // =============================================================
+
   private handleWebSocketUpgrade(request: Request): Response {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
@@ -375,170 +616,29 @@ export class AutonomousAgent {
     const userMsg = payload.content;
     try {
       this.storage.getDurableObjectState().waitUntil?.(
-        this.processMessage(userMsg, ws).catch((err) => {
-          console.error('[DurableAgent] processMessage failed:', err);
+        this.processWebSocketMessage(userMsg, ws).catch((err) => {
+          console.error('[DurableAgent] processWebSocketMessage failed:', err);
           this.send(ws, { type: 'error', error: 'Processing failed' });
         })
       );
     } catch {
-      void this.processMessage(userMsg, ws);
+      void this.processWebSocketMessage(userMsg, ws);
     }
   }
 
-  private async processMessage(userMsg: string, ws: WebSocket | null): Promise<void> {
-    return this.storage.withTransaction(async (state) => {
-      state.lastActivityAt = Date.now();
-
-      // Save user message to DO memory
-      await this.storage.saveMessage('user', [{ text: userMsg }]);
-      const messageRecord: Message = {
-        role: 'user',
-        parts: [{ text: userMsg }],
-        timestamp: Date.now(),
-      };
-      this.pendingFlush.push(messageRecord);
-
-      // Save to vector memory
-      if (this.memory) {
-        await this.saveToMemory('user', userMsg);
-      }
-
-      const history = this.storage.getMessages();
-
-      // 🧠 Check for high-similarity LTM (like Python's threshold check)
-      let shouldUseCachedResponse = false;
-      let cachedResponse = '';
-      
-      if (this.memory) {
-        ws && this.send(ws, { 
-          type: 'status', 
-          message: 'Searching memory for relevant context...' 
-        });
-        
-        try {
-          const memoryResult = await this.memory.buildEnhancedContext(userMsg, undefined, {
-            includeSTM: true,
-            includeLTM: true,
-            maxSTMResults: 5,
-            maxLTMResults: 3,
-          });
-          
-          // If we found a very similar query (>90%), consider using cached response
-          if (memoryResult.hasHighSimilarity && memoryResult.similarQuery) {
-            const ltmResults = await this.memory.searchLongTermMemory(userMsg, 1);
-            if (ltmResults.length > 0 && ltmResults[0].score >= 0.9) {
-              // Check if there's a stored answer
-              const storedAnswer = ltmResults[0].metadata?.answer;
-              if (storedAnswer) {
-                shouldUseCachedResponse = true;
-                cachedResponse = storedAnswer;
-                ws && this.send(ws, {
-                  type: 'status',
-                  message: `Found highly similar past query (${(ltmResults[0].score * 100).toFixed(1)}% match) - using optimized response...`,
-                });
-              }
-            }
-          }
-        } catch (error) {
-          console.error('[DurableAgent] Memory context building failed:', error);
-        }
-      }
-
-      let finalResponse = '';
-      let completed = false;
-      
-      while (!completed) {
-        try {
-          if (shouldUseCachedResponse && cachedResponse) {
-            finalResponse = `[Based on similar past query]\n\n${cachedResponse}`;
-            completed = true;
-            
-            // Stream the cached response
-            if (ws) {
-              const words = finalResponse.split(' ');
-              for (const word of words) {
-                this.send(ws, { type: 'chunk', content: word + ' ' });
-                await new Promise(r => setTimeout(r, 10)); // Small delay for natural feel
-              }
-            }
-            
-            // Update LTM access stats
-            if (this.memory) {
-              const ltmResults = await this.memory.searchLongTermMemory(userMsg, 1);
-              if (ltmResults.length > 0 && ltmResults[0].metadata?.id) {
-                // Increment interaction count
-                await this.memory.updateLongTermMemory({
-                  ...ltmResults[0].metadata,
-                  lastAccessed: Date.now(),
-                  interactions: (ltmResults[0].metadata.interactions || 0) + 1,
-                });
-              }
-            }
-          } else {
-            // Normal agent execution with memory context
-            const result = await this.agent.run(
-              userMsg,
-              history,
-              state,
-              {
-                onChunk: (chunk) => ws && this.send(ws, { type: 'chunk', content: chunk }),
-                onStatus: (status) => ws && this.send(ws, { type: 'status', message: status }),
-                onToolUse: (tools) => ws && this.send(ws, { type: 'tool_use', tools }),
-                onError: (error) => ws && this.send(ws, { type: 'error', error }),
-                onDone: (batchTurns, len) => {
-                  ws && this.send(ws, { type: 'done', turns: batchTurns, length: len });
-                },
-              }
-            );
-            
-            finalResponse += result.response;
-            completed = result.completed;
-          }
-
-          if (completed) {
-            await this.storage.saveMessage('model', [{ text: finalResponse }]);
-            const modelRecord: Message = {
-              role: 'model',
-              parts: [{ text: finalResponse }],
-              timestamp: Date.now(),
-            };
-            this.pendingFlush.push(modelRecord);
-
-            // Save assistant response to memory
-            if (this.memory) {
-              await this.saveToMemory('model', finalResponse);
-            }
-
-            ws && this.send(ws, { type: 'complete', response: finalResponse });
-
-            await this.flushPendingToD1();
-
-            // Create long-term memory summary if session is significant
-            // (Like Python's save_ltm after every 15 messages)
-            if (this.memory && history.length > 0 && history.length % 15 === 0) {
-              ws && this.send(ws, {
-                type: 'status',
-                message: 'Creating long-term memory summary...',
-              });
-              await this.maybeCreateLTM(history, userMsg, finalResponse);
-            }
-          } else {
-            ws && this.send(ws, {
-              type: 'continuing',
-              message: `Chaining next reasoning step...`,
-            });
-            // Continue loop without alarm
-          }
-        } catch (err) {
-          console.error('[DurableAgent] processMessage error:', err);
-          ws && this.send(ws, { type: 'error', error: String(err) });
-        }
-      }
-    });
+  private async processWebSocketMessage(userMsg: string, ws: WebSocket): Promise<void> {
+    if (this.useV2Orchestration) {
+      await this.processMessageV2(userMsg, ws);
+    } else {
+      // For V1, we still need to implement WS streaming
+      // For now, fallback to basic implementation
+      const response = await this.processMessageV1(userMsg);
+      this.send(ws, { type: 'complete', response });
+    }
   }
 
   // =============================================================
-  // Memory Helper Methods
+  // 🧠 Memory Helper Methods (Shared)
   // =============================================================
 
   private async saveToMemory(role: 'user' | 'model', content: string): Promise<void> {
@@ -552,7 +652,7 @@ export class AutonomousAgent {
           sessionId: this.sessionId,
           timestamp: Date.now(),
           role,
-          importance: role === 'user' ? 0.8 : 0.7, // User messages slightly more important
+          importance: role === 'user' ? 0.8 : 0.7,
         },
       });
     } catch (error) {
@@ -568,25 +668,19 @@ export class AutonomousAgent {
     if (!this.memory || !this.sessionId) return;
 
     try {
-      // Get the last N messages for summarization
       const messagesToSummarize = history.slice(-15).map(m => ({
         role: m.role,
         content: m.parts?.map(p => (typeof p === 'string' ? p : p.text)).join(' ') || '',
       }));
 
-      // Generate summary using Gemini (like Python's summarization)
       const summary = await this.memory.summarizeConversation(messagesToSummarize);
-      
-      // Extract key topics (like Python's topic extraction)
       const topics = await this.memory.extractImportantTopics(summary);
 
-      // Extract all user queries from the batch
       const userQueries = messagesToSummarize
         .filter(m => m.role === 'user')
         .map(m => m.content)
         .join(' | ');
 
-      // Create LTM entry (similar to Python's SessionDict)
       await this.memory.addLongTermMemory({
         id: `ltm_${this.sessionId}_${Date.now()}`,
         sessionId: this.sessionId,
@@ -596,7 +690,6 @@ export class AutonomousAgent {
         timestamp: Date.now(),
         interactions: 1,
         lastAccessed: Date.now(),
-        // Store the last response for potential reuse
         answer: lastResponse,
         topics: topics.join(', '),
       } as any);
@@ -608,21 +701,13 @@ export class AutonomousAgent {
   }
 
   private calculateImportance(summary: string, topics: string[]): number {
-    // Calculate importance score based on:
-    // 1. Length of summary (longer = more detailed = more important)
-    // 2. Number of topics (more topics = more comprehensive)
-    // 3. Presence of certain keywords
+    let score = 0.5;
     
-    let score = 0.5; // Base score
-    
-    // Adjust for summary length
     if (summary.length > 500) score += 0.2;
     else if (summary.length > 200) score += 0.1;
     
-    // Adjust for topic count
     score += Math.min(topics.length * 0.05, 0.2);
     
-    // Check for important keywords
     const importantKeywords = [
       'error', 'bug', 'fix', 'solution', 'problem',
       'deploy', 'production', 'critical', 'important',
@@ -636,12 +721,11 @@ export class AutonomousAgent {
     
     score += Math.min(keywordMatches * 0.05, 0.15);
     
-    // Ensure score is between 0.5 and 1.0
     return Math.min(Math.max(score, 0.5), 1.0);
   }
 
   // =============================================================
-  // Existing Methods (unchanged)
+  // 💾 D1 Persistence (Shared)
   // =============================================================
 
   private async flushPendingToD1(): Promise<void> {
@@ -686,6 +770,10 @@ export class AutonomousAgent {
       console.error('[DurableAgent] D1 load failed:', err);
     }
   }
+
+  // =============================================================
+  // 📡 Utility Methods
+  // =============================================================
 
   private send(ws: WebSocket | null, data: unknown): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
