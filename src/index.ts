@@ -1,8 +1,13 @@
+// src/index.ts - Refactored with SessionManager and Clean Routing
 import { AutonomousAgent } from './durable-agent';
 import type { Env } from './types';
-import { D1Manager } from './storage/d1-manager';
+import { SessionManager } from './session/session-manager';
 
 export { AutonomousAgent };
+
+// =============================================================
+// Helper Functions
+// =============================================================
 
 function getSessionId(request: Request): string | null {
   const url = new URL(request.url);
@@ -11,10 +16,9 @@ function getSessionId(request: Request): string | null {
   return fromQuery || fromHeader || null;
 }
 
-// Safe base64 helpers for Workers
 function decodeBase64(str: string) {
   return JSON.parse(
-    new TextDecoder().decode(Uint8Array.from(atob(str), c => c.charCodeAt(0)))
+    new TextDecoder().decode(Uint8Array.from(atob(str), (c) => c.charCodeAt(0)))
   );
 }
 
@@ -37,275 +41,20 @@ async function verifyAuth(request: Request, env: Env): Promise<boolean> {
   }
 }
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // Authentication gate (skip certain paths)
-    if (
-      env.JWT_SECRET &&
-      !path.startsWith('/auth/') &&
-      !path.startsWith('/health') &&
-      path !== '/'
-    ) {
-      const authed = await verifyAuth(request, env);
-      if (!authed) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-    }
-
-    // -------- AUTH ROUTES --------
-    if (path === '/auth/login' && request.method === 'POST') {
-      return handleLogin(request, env);
-    }
-
-    // -------- D1 ROUTES --------
-    if (path === '/api/d1/init' && request.method === 'POST') {
-      return initializeD1(env);
-    }
-
-    if (path === '/api/d1/status' && request.method === 'GET') {
-      return getD1Status(env);
-    }
-
-    // -------- SESSION ROUTES --------
-    if (path === '/api/sessions' && request.method === 'GET') {
-      return listSessions(env);
-    }
-
-    if (path === '/api/sessions' && request.method === 'POST') {
-      return createSession(request, env);
-    }
-
-    if (path.startsWith('/api/sessions/') && request.method === 'GET') {
-      const sessionId = path.split('/').pop()!;
-      return getSession(sessionId, env);
-    }
-
-    if (path.startsWith('/api/sessions/') && request.method === 'PATCH') {
-      const sessionId = path.split('/').pop()!;
-      return updateSession(sessionId, request, env);
-    }
-
-    if (path.startsWith('/api/sessions/') && request.method === 'DELETE') {
-      const sessionId = path.split('/').pop()!;
-      return deleteSession(sessionId, env);
-    }
-
-    // -------- DURABLE OBJECT (AGENT) ROUTES --------
-    if (path.startsWith('/api/')) {
-      // Require session ID for agent interactions
-      const sessionId = getSessionId(request);
-      
-      if (!sessionId) {
-        return new Response(
-          JSON.stringify({ 
-            error: 'Session ID required. Use X-Session-ID header or session_id query param' 
-          }),
-          {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          }
-        );
-      }
-
-      try {
-        // Create Durable Object ID from session ID
-        const id = env.AGENT.idFromName(`session:${sessionId}`);
-        const stub = env.AGENT.get(id);
-
-        // Ensure session exists in D1
-        if (env.DB) {
-          const d1 = new D1Manager(env.DB);
-          ctx.waitUntil(
-            d1.getSession(sessionId).then(session => {
-              if (!session) {
-                return d1.createSession(sessionId, 'New Session');
-              }
-            })
-          );
-        }
-
-        // Handle WebSocket via fetch (as WebSockets can't be passed over RPC)
-        if (path === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-          // Add session ID to request headers if needed, but since ID is in name, optional
-          const modifiedRequest = new Request(request);
-          modifiedRequest.headers.set('X-Session-ID', sessionId);
-          return await stub.fetch(modifiedRequest);
-        }
-
-        // Handle RPC for other paths
-        if (path === '/api/chat' && request.method === 'POST') {
-          const body = await request.json() as { message: string };
-          const message = body.message?.trim();
-          if (!message) throw new Error('Missing message');
-          const res = await stub.handleChat(message);
-          return new Response(JSON.stringify(res), { headers: { 'Content-Type': 'application/json' } });
-        }
-
-        if (path === '/api/history' && request.method === 'GET') {
-          const res = await stub.getHistory();
-          return new Response(JSON.stringify(res), { headers: { 'Content-Type': 'application/json' } });
-        }
-
-        if (path === '/api/clear' && request.method === 'POST') {
-          const res = await stub.clearHistory();
-          return new Response(JSON.stringify(res), { headers: { 'Content-Type': 'application/json' } });
-        }
-
-        if (path === '/api/status' && request.method === 'GET') {
-          const res = await stub.getStatus();
-          return new Response(JSON.stringify(res), { headers: { 'Content-Type': 'application/json' } });
-        }
-
-        if (path === '/api/sync' && request.method === 'POST') {
-          const res = await stub.syncToD1();
-          return new Response(JSON.stringify(res), { headers: { 'Content-Type': 'application/json' } });
-        }
-
-        if (path === '/api/memory/search' && request.method === 'POST') {
-          const body = await request.json() as { query: string; topK?: number };
-          const res = await stub.searchMemory(body);
-          return new Response(JSON.stringify(res), { headers: { 'Content-Type': 'application/json' } });
-        }
-
-        if (path === '/api/memory/stats' && request.method === 'GET') {
-          const res = await stub.getMemoryStats();
-          return new Response(JSON.stringify(res), { headers: { 'Content-Type': 'application/json' } });
-        }
-
-        if (path === '/api/memory/summarize' && request.method === 'POST') {
-          const res = await stub.summarizeSession();
-          return new Response(JSON.stringify(res), { headers: { 'Content-Type': 'application/json' } });
-        }
-
-        return new Response('Not Found', { status: 404 });
-      } catch (err: any) {
-        console.error('[Worker] DO error:', err);
-        return new Response(
-          JSON.stringify({
-            error: err.message || 'Durable Object Error',
-          }),
-          {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' },
-          }
-        );
-      }
-    }
-
-    // -------- ROOT / HEALTH --------
-    if (path === '/' || path === '/health') {
-      let d1Status = { enabled: false, healthy: false, initialized: false };
-
-      if (env.DB) {
-        const d1 = new D1Manager(env.DB);
-        d1Status = {
-          enabled: true,
-          healthy: await d1.healthCheck(),
-          initialized: d1.isInitialized(),
-        };
-      }
-
-      return new Response(
-        JSON.stringify({
-          status: 'ok',
-          message: 'Orion Personal Assistant running',
-          version: '3.0.0-session-management',
-          d1: d1Status,
-          authEnabled: !!env.JWT_SECRET,
-        }),
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-
-    return new Response('Not found', { status: 404 });
-  },
-};
-
-// -----------------------------------------------------------------------------
-// D1 ADMIN FUNCTIONS
-// -----------------------------------------------------------------------------
-
-async function initializeD1(env: Env): Promise<Response> {
-  if (!env.DB) {
-    return new Response(
-      JSON.stringify({ error: 'D1 not configured in wrangler.toml' }),
-      { status: 400, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
-
-  try {
-    const d1 = new D1Manager(env.DB);
-    await d1.reinitialize();
-    const stats = await d1.getStats();
-
-    return new Response(
-      JSON.stringify({
-        ok: true,
-        message: 'D1 schema initialized successfully',
-        stats,
-      }),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    return new Response(
-      JSON.stringify({
-        error: 'Initialization failed',
-        details: String(error),
-      }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
+function jsonResponse(data: any, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
-async function getD1Status(env: Env): Promise<Response> {
-  if (!env.DB) {
-    return new Response(
-      JSON.stringify({ enabled: false, message: 'D1 not configured' }),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-  }
-
-  try {
-    const d1 = new D1Manager(env.DB);
-    const [healthy, stats] = await Promise.all([
-      d1.healthCheck(),
-      d1.getStats(),
-    ]);
-
-    return new Response(
-      JSON.stringify({
-        enabled: true,
-        healthy,
-        initialized: d1.isInitialized(),
-        stats,
-        freeTierLimits: {
-          storage: '5 GB',
-          readsPerDay: '5 million',
-          writesPerDay: '100,000',
-        },
-      }),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    return new Response(
-      JSON.stringify({
-        error: 'Status check failed',
-        details: String(error),
-      }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
+function errorResponse(error: string, status = 500): Response {
+  return jsonResponse({ error }, status);
 }
 
-// -----------------------------------------------------------------------------
-// AUTH
-// -----------------------------------------------------------------------------
+// =============================================================
+// Route Handlers
+// =============================================================
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
   try {
@@ -317,17 +66,11 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     const { email, password } = body;
 
     if (!email || !password) {
-      return new Response(JSON.stringify({ error: 'Email & password required' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return errorResponse('Email & password required', 400);
     }
 
     if (email !== env.ADMIN_GMAIL) {
-      return new Response(JSON.stringify({ error: 'Invalid credentials' }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return errorResponse('Invalid credentials', 401);
     }
 
     // Hash the password
@@ -335,16 +78,13 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     const data = encoder.encode(password);
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
-    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    const hashHex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 
     if (env.ADMIN_PASSWORD_HASH && hashHex !== env.ADMIN_PASSWORD_HASH) {
-      return new Response(JSON.stringify({ error: 'Invalid credentials' }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return errorResponse('Invalid credentials', 401);
     }
 
-    // NOT a proper JWT, but preserved for compatibility
+    // Create JWT-like token (not cryptographically secure)
     const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
     const payload = btoa(
       JSON.stringify({
@@ -362,166 +102,342 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
 
     const token = `${header}.${payload}.${signature}`;
 
-    return new Response(JSON.stringify({ token, email }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonResponse({ token, email });
   } catch (error) {
-    return new Response(
-      JSON.stringify({
-        error: 'Invalid request',
-        details: String(error),
-      }),
-      {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      }
-    );
+    return errorResponse('Invalid request', 400);
   }
 }
 
-// -----------------------------------------------------------------------------
-// SESSION MANAGEMENT
-// -----------------------------------------------------------------------------
-
-async function listSessions(env: Env): Promise<Response> {
+async function handleD1Init(env: Env): Promise<Response> {
   if (!env.DB) {
-    return new Response(JSON.stringify({ error: 'D1 not configured' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return errorResponse('D1 not configured in wrangler.toml', 400);
   }
 
   try {
-    const d1 = new D1Manager(env.DB);
-    const sessions = await d1.listSessions(50);
+    const sessionManager = new SessionManager(env.DB);
+    // Force reinitialization
+    await (sessionManager as any).d1.reinitialize();
+    const stats = await (sessionManager as any).d1.getStats();
 
-    return new Response(JSON.stringify({ sessions }), {
-      headers: { 'Content-Type': 'application/json' },
+    return jsonResponse({
+      ok: true,
+      message: 'D1 schema initialized successfully',
+      stats,
     });
-  } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  } catch (error) {
+    return errorResponse(`Initialization failed: ${error}`, 500);
   }
 }
 
-async function createSession(request: Request, env: Env): Promise<Response> {
+async function handleD1Status(env: Env): Promise<Response> {
   if (!env.DB) {
-    return new Response(JSON.stringify({ error: 'D1 not configured' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
+    return jsonResponse({ enabled: false, message: 'D1 not configured' });
+  }
+
+  try {
+    const sessionManager = new SessionManager(env.DB);
+    const d1 = (sessionManager as any).d1;
+
+    const [healthy, stats] = await Promise.all([d1.healthCheck(), d1.getStats()]);
+
+    return jsonResponse({
+      enabled: true,
+      healthy,
+      initialized: d1.isInitialized(),
+      stats,
+      freeTierLimits: {
+        storage: '5 GB',
+        readsPerDay: '5 million',
+        writesPerDay: '100,000',
+      },
     });
+  } catch (error) {
+    return errorResponse(`Status check failed: ${error}`, 500);
+  }
+}
+
+async function handleSessionList(env: Env): Promise<Response> {
+  if (!env.DB) {
+    return errorResponse('D1 not configured', 400);
+  }
+
+  try {
+    const sessionManager = new SessionManager(env.DB);
+    const sessions = await sessionManager.listSessions(50);
+    return jsonResponse({ sessions });
+  } catch (err) {
+    return errorResponse(String(err), 500);
+  }
+}
+
+async function handleSessionCreate(request: Request, env: Env): Promise<Response> {
+  if (!env.DB) {
+    return errorResponse('D1 not configured', 400);
   }
 
   try {
     const body = (await request.json()) as { title?: string };
     const title = body.title || 'New Session';
-    const sessionId = crypto.randomUUID();
+    const sessionId = SessionManager.generateSessionId();
 
-    const d1 = new D1Manager(env.DB);
-    const session = await d1.createSession(sessionId, title);
+    const sessionManager = new SessionManager(env.DB);
+    const session = await sessionManager.getOrCreateSession(sessionId, title);
 
-    return new Response(JSON.stringify(session), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonResponse(session);
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return errorResponse(String(err), 500);
   }
 }
 
-async function getSession(sessionId: string, env: Env): Promise<Response> {
+async function handleSessionGet(sessionId: string, env: Env): Promise<Response> {
   if (!env.DB) {
-    return new Response(JSON.stringify({ error: 'D1 not configured' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return errorResponse('D1 not configured', 400);
   }
 
   try {
-    const d1 = new D1Manager(env.DB);
-    const session = await d1.getSession(sessionId);
-
-    if (!session) {
-      return new Response(JSON.stringify({ error: 'Session not found' }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
-    return new Response(JSON.stringify(session), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    const sessionManager = new SessionManager(env.DB);
+    const session = await sessionManager.getOrCreateSession(sessionId);
+    return jsonResponse(session);
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return errorResponse('Session not found', 404);
   }
 }
 
-async function updateSession(
+async function handleSessionUpdate(
   sessionId: string,
   request: Request,
   env: Env
 ): Promise<Response> {
   if (!env.DB) {
-    return new Response(JSON.stringify({ error: 'D1 not configured' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return errorResponse('D1 not configured', 400);
   }
 
   try {
     const body = (await request.json()) as { title?: string };
-    
+
     if (!body.title) {
-      return new Response(JSON.stringify({ error: 'Title required' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return errorResponse('Title required', 400);
     }
 
-    const d1 = new D1Manager(env.DB);
+    const d1 = (new SessionManager(env.DB) as any).d1;
     await d1.updateSessionTitle(sessionId, body.title);
 
     const session = await d1.getSession(sessionId);
-    return new Response(JSON.stringify(session), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonResponse(session);
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return errorResponse(String(err), 500);
   }
 }
 
-async function deleteSession(
-  sessionId: string,
-  env: Env
-): Promise<Response> {
+async function handleSessionDelete(sessionId: string, env: Env): Promise<Response> {
   if (!env.DB) {
-    return new Response(JSON.stringify({ error: 'D1 not configured' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return errorResponse('D1 not configured', 400);
   }
 
   try {
-    const d1 = new D1Manager(env.DB);
-    await d1.deleteSession(sessionId);
-
-    return new Response(JSON.stringify({ ok: true }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    const sessionManager = new SessionManager(env.DB);
+    await sessionManager.deleteSession(sessionId);
+    return jsonResponse({ ok: true });
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return errorResponse(String(err), 500);
   }
 }
+
+// =============================================================
+// Durable Object Routing
+// =============================================================
+
+async function handleDurableObjectRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // Require session ID
+  const sessionId = getSessionId(request);
+
+  if (!sessionId) {
+    return errorResponse(
+      'Session ID required. Use X-Session-ID header or session_id query param',
+      400
+    );
+  }
+
+  // Validate session ID format
+  if (!SessionManager.validateSessionId(sessionId)) {
+    return errorResponse('Invalid session ID format', 400);
+  }
+
+  try {
+    // Create Durable Object ID from session ID
+    const id = env.AGENT.idFromName(`session:${sessionId}`);
+    const stub = env.AGENT.get(id);
+
+    // Ensure session exists in D1
+    if (env.DB) {
+      const sessionManager = new SessionManager(env.DB);
+      ctx.waitUntil(
+        sessionManager.getOrCreateSession(sessionId).catch((err) => {
+          console.error('[Worker] Failed to ensure session:', err);
+        })
+      );
+    }
+
+    // Handle WebSocket via fetch (WebSockets can't be passed over RPC)
+    if (path === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+      return await stub.fetch(request);
+    }
+
+    // Route RPC calls
+    switch (path) {
+      case '/api/chat':
+        if (request.method === 'POST') {
+          const body = (await request.json()) as { message: string };
+          const message = body.message?.trim();
+          if (!message) throw new Error('Missing message');
+          const res = await stub.handleChat(message);
+          return jsonResponse(res);
+        }
+        break;
+
+      case '/api/history':
+        if (request.method === 'GET') {
+          const res = await stub.getHistory();
+          return jsonResponse(res);
+        }
+        break;
+
+      case '/api/clear':
+        if (request.method === 'POST') {
+          const res = await stub.clearHistory();
+          return jsonResponse(res);
+        }
+        break;
+
+      case '/api/status':
+        if (request.method === 'GET') {
+          const res = await stub.getStatus();
+          return jsonResponse(res);
+        }
+        break;
+
+      case '/api/sync':
+        if (request.method === 'POST') {
+          const res = await stub.syncToD1();
+          return jsonResponse(res);
+        }
+        break;
+
+      case '/api/memory/search':
+        if (request.method === 'POST') {
+          const body = (await request.json()) as { query: string; topK?: number };
+          const res = await stub.searchMemory(body);
+          return jsonResponse(res);
+        }
+        break;
+
+      case '/api/memory/stats':
+        if (request.method === 'GET') {
+          const res = await stub.getMemoryStats();
+          return jsonResponse(res);
+        }
+        break;
+
+      case '/api/memory/summarize':
+        if (request.method === 'POST') {
+          const res = await stub.summarizeSession();
+          return jsonResponse(res);
+        }
+        break;
+    }
+
+    return new Response('Not Found', { status: 404 });
+  } catch (err: any) {
+    console.error('[Worker] DO error:', err);
+    return errorResponse(err.message || 'Durable Object Error', 500);
+  }
+}
+
+// =============================================================
+// Main Worker
+// =============================================================
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // Authentication gate (skip certain paths)
+    const publicPaths = ['/auth/', '/health', '/'];
+    const isPublic = publicPaths.some((p) => path.startsWith(p));
+
+    if (env.JWT_SECRET && !isPublic) {
+      const authed = await verifyAuth(request, env);
+      if (!authed) {
+        return errorResponse('Unauthorized', 401);
+      }
+    }
+
+    // -------- ROUTE MATCHING --------
+
+    // Health check
+    if (path === '/' || path === '/health') {
+      let d1Status = { enabled: false, healthy: false, initialized: false };
+
+      if (env.DB) {
+        const sessionManager = new SessionManager(env.DB);
+        const d1 = (sessionManager as any).d1;
+        d1Status = {
+          enabled: true,
+          healthy: await d1.healthCheck(),
+          initialized: d1.isInitialized(),
+        };
+      }
+
+      return jsonResponse({
+        status: 'ok',
+        message: 'Orion Personal Assistant running',
+        version: '4.0.0-refactored-architecture',
+        d1: d1Status,
+        authEnabled: !!env.JWT_SECRET,
+      });
+    }
+
+    // Auth routes
+    if (path === '/auth/login' && request.method === 'POST') {
+      return handleLogin(request, env);
+    }
+
+    // D1 admin routes
+    if (path === '/api/d1/init' && request.method === 'POST') {
+      return handleD1Init(env);
+    }
+
+    if (path === '/api/d1/status' && request.method === 'GET') {
+      return handleD1Status(env);
+    }
+
+    // Session management routes
+    if (path === '/api/sessions') {
+      if (request.method === 'GET') return handleSessionList(env);
+      if (request.method === 'POST') return handleSessionCreate(request, env);
+    }
+
+    if (path.startsWith('/api/sessions/')) {
+      const sessionId = path.split('/').pop()!;
+
+      if (request.method === 'GET') return handleSessionGet(sessionId, env);
+      if (request.method === 'PATCH') return handleSessionUpdate(sessionId, request, env);
+      if (request.method === 'DELETE') return handleSessionDelete(sessionId, env);
+    }
+
+    // Durable Object routes (everything under /api/)
+    if (path.startsWith('/api/')) {
+      return handleDurableObjectRequest(request, env, ctx);
+    }
+
+    return new Response('Not found', { status: 404 });
+  },
+};
