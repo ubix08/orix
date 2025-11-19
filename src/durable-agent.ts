@@ -57,10 +57,10 @@ export class AutonomousAgent extends DurableObject {
     }
   }
 
-  private async init(): Promise<void> {
+    private async init(): Promise<void> {
     if (this.initialized) return;
 
-    // Initialize memory if we have session ID and vectorize
+    // 1. Initialize memory (if available)
     if (this.sessionId && this.env.VECTORIZE && !this.memory) {
       this.memory = new MemoryManager(
         this.env.VECTORIZE,
@@ -74,32 +74,39 @@ export class AutonomousAgent extends DurableObject {
       console.log('[DurableAgent] Memory system initialized');
     }
 
-    // Initialize MessageService
-    if (this.sessionId && this.d1) {
+    // 2. Initialize MessageService (ALWAYS create this, regardless of D1)
+    if (this.sessionId) {
       this.messageService = new MessageService(
         this.storage,
         this.sessionId,
         this.memory
       );
 
-      // Set D1 flush handler
-      this.messageService.setD1FlushHandler(async (messages: Message[]) => {
-        if (this.d1 && this.sessionId) {
-          await this.d1.saveMessages(this.sessionId, messages);
-          await this.d1.updateSessionActivity(this.sessionId);
-        }
-      });
-
-      console.log('[DurableAgent] MessageService initialized');
+      // 3. OPTIONAL: Attach D1 Flush Handler only if D1 is available
+      if (this.d1) {
+        this.messageService.setD1FlushHandler(async (messages: Message[]) => {
+          if (this.d1 && this.sessionId) {
+            await this.d1.saveMessages(this.sessionId, messages);
+            await this.d1.updateSessionActivity(this.sessionId);
+          }
+        });
+        console.log('[DurableAgent] MessageService connected to D1');
+      } else {
+        console.log('[DurableAgent] MessageService running in RAM/DO-Storage only (No D1)');
+      }
+    } else {
+      console.error('[DurableAgent] Critical: No Session ID found during init');
     }
 
-    // Ensure session exists in D1 and hydrate if needed
-    if (this.sessionId && this.sessionManager) {
-      await this.sessionManager.getOrCreateSession(this.sessionId);
-
-      // Hydrate from D1 if DO storage is empty
-      if (this.d1 && this.storage.getMessages().length === 0) {
-        await this.loadFromD1(this.sessionId);
+    // 4. Hydrate from D1 only if available
+    if (this.sessionId && this.sessionManager && this.d1) {
+      try {
+        await this.sessionManager.getOrCreateSession(this.sessionId);
+        if (this.storage.getMessages().length === 0) {
+          await this.loadFromD1(this.sessionId);
+        }
+      } catch (e) {
+        console.warn('[DurableAgent] D1 hydration skipped:', e);
       }
     }
 
