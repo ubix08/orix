@@ -27,6 +27,7 @@ export class AutonomousAgent extends DurableObject {
   private maxTurns = 3;
 
   constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
     this.env = env;
     this.storage = new DurableStorage(state);
     this.gemini = new GeminiClient({ apiKey: env.GEMINI_API_KEY });
