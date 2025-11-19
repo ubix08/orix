@@ -1,21 +1,17 @@
-// src/agent-core.ts - Memory-Enhanced
+// src/agent-core.ts - Refactored as Single-Turn LLM Wrapper
 // =============================================================
-// 🌌 Orion AGI Core — Contextual ReAct Agent with Memory Integration
+// 🤖 Agent — Single-turn LLM wrapper with tool execution
 // =============================================================
 
 import type { AgentState, Message } from './types';
 import type { GeminiClient, GenerateOptions } from './gemini';
 import type { Tool, ToolCall, ToolResult } from './tools/types';
 import { ToolRegistry } from './tools/registry';
-import type { MemoryManager } from './memory/memory-manager';
 
 // =============================================================
-// Agent Configuration & Callbacks
+// Agent Configuration
 // =============================================================
 export interface AgentConfig {
-  maxHistoryMessages?: number;
-  maxMessageSize?: number;
-  maxTurns?: number;
   model?: string;
   thinkingBudget?: number;
   temperature?: number;
@@ -23,38 +19,34 @@ export interface AgentConfig {
   useCodeExecution?: boolean;
   useMapsGrounding?: boolean;
   useVision?: boolean;
-  enableMemory?: boolean;
 }
 
-export interface ChunkCallback { (chunk: string): void; }
-export interface StatusCallback { (message: string): void; }
-export interface ToolUseCallback { (tools: string[]): void; }
-
-export interface AgentCallbacks {
-  onChunk?: ChunkCallback;
-  onStatus?: StatusCallback;
-  onToolUse?: ToolUseCallback;
+export interface StepCallbacks {
+  onChunk?: (chunk: string) => void;
+  onStatus?: (message: string) => void;
+  onToolUse?: (tools: string[]) => void;
   onError?: (error: string) => void;
-  onDone?: (turns: number, totalLength: number) => void;
+}
+
+export interface StepResult {
+  text: string;
+  toolCalls: ToolCall[];
+  completed: boolean; // true if no tool calls, false if needs continuation
 }
 
 // =============================================================
-// 🧠 Core Agent with Memory
+// 🤖 Agent — Pure LLM Wrapper (No Loop)
 // =============================================================
 export class Agent {
   private config: Required<AgentConfig>;
   private gemini: GeminiClient;
   private toolRegistry: ToolRegistry;
-  private memory?: MemoryManager;
 
   constructor(gemini: GeminiClient, config: AgentConfig = {}) {
     this.gemini = gemini;
     this.toolRegistry = new ToolRegistry();
 
     this.config = {
-      maxHistoryMessages: config.maxHistoryMessages ?? 200,
-      maxMessageSize: config.maxMessageSize ?? 100_000,
-      maxTurns: config.maxTurns ?? 3,
       model: config.model ?? 'gemini-2.5-flash',
       thinkingBudget: config.thinkingBudget ?? 1024,
       temperature: config.temperature ?? 0.7,
@@ -62,37 +54,53 @@ export class Agent {
       useCodeExecution: config.useCodeExecution ?? true,
       useMapsGrounding: config.useMapsGrounding ?? false,
       useVision: config.useVision ?? false,
-      enableMemory: config.enableMemory ?? true,
     };
   }
 
   // -----------------------------------------------------------
   // 🔧 Configuration Management
   // -----------------------------------------------------------
-  getConfig(): Readonly<Required<AgentConfig>> { return { ...this.config }; }
-  updateConfig(updates: Partial<AgentConfig>): void { this.config = { ...this.config, ...updates }; }
+  getConfig(): Readonly<Required<AgentConfig>> {
+    return { ...this.config };
+  }
 
-  registerTool(tool: Tool): void { this.toolRegistry.register(tool); }
-  unregisterTool(name: string): void { this.toolRegistry.unregister(name); }
-  getRegisteredTools(): Tool[] { return this.toolRegistry.getAll(); }
+  updateConfig(updates: Partial<AgentConfig>): void {
+    this.config = { ...this.config, ...updates as any };
+  }
 
-  // Memory management
-  setMemory(memory: MemoryManager): void { this.memory = memory; }
-  getMemory(): MemoryManager | undefined { return this.memory; }
+  registerTool(tool: Tool): void {
+    this.toolRegistry.register(tool);
+  }
+
+  unregisterTool(name: string): void {
+    this.toolRegistry.unregister(name);
+  }
+
+  getRegisteredTools(): Tool[] {
+    return this.toolRegistry.getAll();
+  }
 
   // =============================================================
-  // 🧩 Core ReAct Loop with Memory
+  // 🧩 Single-Turn Execution (No Loop)
   // =============================================================
 
   /**
-   * Executes a single reasoning + response step.
+   * Execute a single reasoning turn with optional tool calls.
+   * Returns immediately after LLM response, does NOT loop.
+   * 
+   * @param formattedHistory - Conversation history (including system prompt)
+   * @param state - Agent state for tool execution context
+   * @param callbacks - Streaming and status callbacks
+   * @returns StepResult with text, toolCalls, and completion status
    */
-  async run_step(
+  async executeStep(
     formattedHistory: any[],
     state: AgentState,
-    callbacks: AgentCallbacks,
-    memoryContext?: string
-  ): Promise<{ text: string; toolCalls?: ToolCall[] }> {
+    callbacks: StepCallbacks = {}
+  ): Promise<StepResult> {
+    callbacks.onStatus?.('Reasoning...');
+
+    // Build generation options
     const options: GenerateOptions = {
       model: this.config.model,
       temperature: this.config.temperature,
@@ -105,159 +113,48 @@ export class Agent {
       files: state.context?.files ?? [],
     };
 
+    // Stream LLM response
     let fullResponse = '';
     const batcher = this.createChunkBatcher(callbacks.onChunk);
 
-    const response = await this.gemini.generateWithTools(
-      formattedHistory,
-      this.toolRegistry.getAll(),
-      options,
-      (chunk: string) => {
-        fullResponse += chunk;
-        batcher.add(chunk);
-      }
-    );
+    try {
+      const response = await this.gemini.generateWithTools(
+        formattedHistory,
+        this.toolRegistry.getAll(),
+        options,
+        (chunk: string) => {
+          fullResponse += chunk;
+          batcher.add(chunk);
+        }
+      );
 
-    batcher.flush();
+      batcher.flush();
 
-    return {
-      text: fullResponse || response.text || '',
-      toolCalls: response.toolCalls ?? [],
-    };
+      const text = fullResponse || response.text || '';
+      const toolCalls = response.toolCalls ?? [];
+
+      // Determine if this step is complete
+      const completed = toolCalls.length === 0;
+
+      return { text, toolCalls, completed };
+    } catch (error) {
+      callbacks.onError?.(String(error));
+      throw error;
+    }
   }
 
   /**
-   * Main agent entrypoint — runs a ReAct-style conversation with memory integration.
+   * Execute tools from a step result.
+   * Separated from executeStep for flexibility.
    * 
-   * Memory is integrated in three ways:
-   * 1. Pre-execution: Searches for relevant past context (like Python's get_ltm)
-   * 2. During execution: Maintains conversation context (like Python's memory.save_task)
-   * 3. Post-execution: Saves results for future recall (like Python's memory.update_task)
+   * @param toolCalls - Tool calls from LLM response
+   * @param state - Agent state for execution context
+   * @returns Array of tool results
    */
-  async run(
-    userMessage: string,
-    conversationHistory: Message[],
-    state: AgentState,
-    callbacks: AgentCallbacks = {}
-  ): Promise<{ response: string; turns: number; completed: boolean }> {
-    if (userMessage.length > this.config.maxMessageSize) {
-      throw new Error('Message exceeds maximum size');
-    }
-
-    // 🧠 STEP 1: Build memory-enhanced context (like Python's get_ltm + get_previous_task_contexts)
-    let memoryContext = '';
-    let hasHighSimilarity = false;
-    
-    if (this.memory && this.config.enableMemory) {
-      callbacks.onStatus?.('Retrieving relevant context from memory...');
-      
-      try {
-        const memoryResult = await this.memory.buildEnhancedContext(userMessage, undefined, {
-          includeSTM: true,
-          includeLTM: true,
-          maxSTMResults: 5,
-          maxLTMResults: 3,
-        });
-        
-        memoryContext = memoryResult.context;
-        hasHighSimilarity = memoryResult.hasHighSimilarity;
-        
-        if (hasHighSimilarity) {
-          callbacks.onStatus?.(`Found highly similar past query (85%+ match) - leveraging previous solution...`);
-        }
-      } catch (error) {
-        console.error('[Agent] Failed to build memory context:', error);
-      }
-    }
-
-    // 🎯 Build system prompt with memory context
-    const systemPrompt = this.buildSystemPrompt(state, memoryContext);
-    let formattedHistory = this.formatHistory(conversationHistory, systemPrompt, userMessage);
-
-    let totalResponse = '';
-    let turns = 0;
-    let completed = false;
-
-    try {
-      while (turns < this.config.maxTurns) {
-        turns++;
-        callbacks.onStatus?.(`Turn ${turns}/${this.config.maxTurns} | Reasoning...`);
-
-        // 🔄 Execute reasoning step with memory context
-        const step = await this.run_step(formattedHistory, state, callbacks, memoryContext);
-        totalResponse += step.text;
-
-        // 🧠 Save intermediate thoughts to memory (like Python's memory.update_task)
-        if (this.memory && step.text) {
-          try {
-            await this.memory.saveMemory({
-              id: `${state.sessionId}_${Date.now()}_thought_${turns}`,
-              content: step.text,
-              metadata: {
-                sessionId: state.sessionId,
-                timestamp: Date.now(),
-                role: 'model',
-                importance: 0.6,
-                tags: ['thought', `turn_${turns}`],
-              },
-            });
-          } catch (error) {
-            console.error('[Agent] Failed to save thought to memory:', error);
-          }
-        }
-
-        if (step.toolCalls && step.toolCalls.length > 0) {
-          callbacks.onToolUse?.(step.toolCalls.map(t => t.name));
-
-          const toolResults = await this.executeTools(step.toolCalls, state);
-          const resultsText = toolResults
-            .map(r => `[Observation: ${r.name}] ${r.success ? '✅ Success' : '❌ Failed'}\n${r.result}`)
-            .join('\n\n');
-
-          // 🧠 Save tool observations to memory
-          if (this.memory) {
-            try {
-              await this.memory.saveMemory({
-                id: `${state.sessionId}_${Date.now()}_observation_${turns}`,
-                content: resultsText,
-                metadata: {
-                  sessionId: state.sessionId,
-                  timestamp: Date.now(),
-                  role: 'model',
-                  importance: 0.7,
-                  tags: ['observation', 'tool_result'],
-                },
-              });
-            } catch (error) {
-              console.error('[Agent] Failed to save observation to memory:', error);
-            }
-          }
-
-          // Append step + observation back to history
-          formattedHistory.push({ role: 'assistant', content: step.text, toolCalls: step.toolCalls });
-          formattedHistory.push({ role: 'user', content: resultsText });
-          continue; // another reasoning cycle
-        }
-
-        // ✅ No tool calls → model is done
-        completed = true;
-        break;
-      }
-
-      callbacks.onDone?.(turns, totalResponse.length);
-      return { response: totalResponse, turns, completed };
-    } catch (err) {
-      console.error('[Agent.run] Error:', err);
-      callbacks.onError?.(String(err));
-      throw err;
-    }
-  }
-
-  // =============================================================
-  // 🛠️ Helpers
-  // =============================================================
-
-  private async executeTools(toolCalls: ToolCall[], state: AgentState): Promise<ToolResult[]> {
+  async executeTools(
+    toolCalls: ToolCall[],
+    state: AgentState
+  ): Promise<ToolResult[]> {
     const settled = await Promise.allSettled(
       toolCalls.map(async (call) => {
         try {
@@ -271,66 +168,37 @@ export class Agent {
         }
       })
     );
+
     return settled
       .filter((r): r is PromiseFulfilledResult<ToolResult> => r.status === 'fulfilled')
-      .map(r => r.value);
+      .map((r) => r.value);
   }
 
-  private formatHistory(messages: Message[], systemPrompt: string, currentUserMessage: string): any[] {
-    const pruned = messages.slice(-this.config.maxHistoryMessages);
-    const formatted: any[] = [{ role: 'system', content: systemPrompt }];
-
-    for (const msg of pruned) {
-      const content = msg.parts
-        ? msg.parts.map((p: any) => typeof p === 'string' ? p : (p.text || '[media]')).join('\n')
-        : msg.content || '';
-      formatted.push({
-        role: msg.role === 'model' ? 'assistant' : 'user',
-        content,
-        ...(msg.toolCalls && { toolCalls: msg.toolCalls }),
-      });
-    }
-
-    formatted.push({ role: 'user', content: currentUserMessage });
-    return formatted;
+  /**
+   * Format tool results into observation text for next turn.
+   * 
+   * @param toolResults - Results from executeTools
+   * @returns Formatted observation string
+   */
+  formatToolResults(toolResults: ToolResult[]): string {
+    return toolResults
+      .map(
+        (r) =>
+          `[Observation: ${r.name}] ${r.success ? '✅ Success' : '❌ Failed'}\n${r.result}`
+      )
+      .join('\n\n');
   }
 
-  private createChunkBatcher(
-    onChunk?: ChunkCallback,
-    flushInterval = 50
-  ): { add: (chunk: string) => void; flush: () => void } {
-    let buffer = '';
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const flush = () => {
-      if (buffer && onChunk) {
-        try {
-          onChunk(buffer);
-          buffer = '';
-        } catch (e) {
-          console.error('[Agent] Chunk callback error:', e);
-        }
-      }
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    };
-
-    return {
-      add: (chunk: string) => {
-        buffer += chunk;
-        if (!timer) timer = setTimeout(flush, flushInterval);
-      },
-      flush,
-    };
-  }
-
-  // =============================================================
-  // 🧭 Memory-Enhanced System Prompt
-  // =============================================================
-  private buildSystemPrompt(state: AgentState, memoryContext?: string): string {
-    const toolNames = this.toolRegistry.getAll().map(t => t.name);
+  /**
+   * Build system prompt with memory context.
+   * Extracted for reusability.
+   * 
+   * @param state - Agent state
+   * @param memoryContext - Optional memory context string
+   * @returns System prompt string
+   */
+  buildSystemPrompt(state: AgentState, memoryContext?: string): string {
+    const toolNames = this.toolRegistry.getAll().map((t) => t.name);
     const hasTools = toolNames.length > 0;
     const hasFiles = (state.context?.files?.length ?? 0) > 0;
     const hasMemory = !!memoryContext && memoryContext.trim() !== 'No relevant past context found.';
@@ -341,7 +209,9 @@ export class Agent {
 You are Orion, a human-like, collaborative AI assistant running on Gemini 2.5 Flash.
 Act as a reasoning partner: naturally reflect, plan, and act to achieve goals efficiently.
 
-${hasMemory ? `
+${
+  hasMemory
+    ? `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📚 AVAILABLE CONTEXT FROM MEMORY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -354,7 +224,9 @@ IMPORTANT: Use this context to inform your responses, but always:
 3. Don't blindly repeat past answers - synthesize new insights
 4. If context seems outdated or irrelevant, acknowledge this
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-` : ''}
+`
+    : ''
+}
 
 🎯 CORE BEHAVIOR
 
@@ -371,7 +243,7 @@ IMPORTANT: Use this context to inform your responses, but always:
 • Code execution (Python)
 • Data/file understanding${hasFiles ? ' (context files loaded)' : ''}
 • Memory-enhanced context awareness${hasMemory ? ' (active)' : ''}
-${hasTools ? `\n• External tools available:\n${toolNames.map(t => `  * ${t}`).join('\n')}` : ''}
+${hasTools ? `\n• External tools available:\n${toolNames.map((t) => `  * ${t}`).join('\n')}` : ''}
 
 🧠 MEMORY-ENHANCED REASONING
 
@@ -403,6 +275,72 @@ Example:
 
 Now begin your reasoning based on the full conversation context and available memory.
 `;
+  }
+
+  /**
+   * Format conversation history for LLM.
+   * 
+   * @param messages - Raw message array
+   * @param systemPrompt - System prompt to prepend
+   * @param currentUserMessage - Current user message to append
+   * @returns Formatted history array
+   */
+  formatHistory(
+    messages: Message[],
+    systemPrompt: string,
+    currentUserMessage: string
+  ): any[] {
+    const formatted: any[] = [{ role: 'system', content: systemPrompt }];
+
+    for (const msg of messages) {
+      const content = msg.parts
+        ? msg.parts.map((p: any) => (typeof p === 'string' ? p : p.text || '[media]')).join('\n')
+        : msg.content || '';
+
+      formatted.push({
+        role: msg.role === 'model' ? 'assistant' : 'user',
+        content,
+        ...(msg.toolCalls && { toolCalls: msg.toolCalls }),
+      });
+    }
+
+    formatted.push({ role: 'user', content: currentUserMessage });
+    return formatted;
+  }
+
+  // =============================================================
+  // 🛠️ Helpers
+  // =============================================================
+
+  private createChunkBatcher(
+    onChunk?: (chunk: string) => void,
+    flushInterval = 50
+  ): { add: (chunk: string) => void; flush: () => void } {
+    let buffer = '';
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const flush = () => {
+      if (buffer && onChunk) {
+        try {
+          onChunk(buffer);
+          buffer = '';
+        } catch (e) {
+          console.error('[Agent] Chunk callback error:', e);
+        }
+      }
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    return {
+      add: (chunk: string) => {
+        buffer += chunk;
+        if (!timer) timer = setTimeout(flush, flushInterval);
+      },
+      flush,
+    };
   }
 }
 
