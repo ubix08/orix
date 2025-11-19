@@ -10,7 +10,7 @@ import { MessageService } from './services/message-service';
 import { SessionManager } from './session/session-manager';
 import type { AgentConfig } from './agent-core';
 
-export class AutonomousAgent {
+export class AutonomousAgent extends DurableObject {
   private storage: DurableStorage;
   private agent: Agent;
   private gemini: GeminiClient;
