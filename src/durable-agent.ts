@@ -1,4 +1,5 @@
 // src/durable-agent.ts - Refactored with ReAct Loop + MessageService
+import { DurableObject } from "cloudflare:workers";
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import type { Env, Message } from './types';
 import { Agent, type StepResult } from './agent-core';
