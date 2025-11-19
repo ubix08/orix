@@ -1,4 +1,4 @@
-// src/index.ts - Refactored with SessionManager and Clean Routing
+// src/index.ts - Refactored with SessionManager and Clean Routing (updated to forward X-Session-ID)
 import { AutonomousAgent } from './durable-agent';
 import type { Env } from './types';
 import { SessionManager } from './session/session-manager';
@@ -255,9 +255,8 @@ async function handleDurableObjectRequest(
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // Require session ID
+  // Require session ID (query param or header)
   const sessionId = getSessionId(request);
-
   if (!sessionId) {
     return errorResponse(
       'Session ID required. Use X-Session-ID header or session_id query param',
@@ -275,7 +274,7 @@ async function handleDurableObjectRequest(
     const id = env.AGENT.idFromName(`session:${sessionId}`);
     const stub = env.AGENT.get(id);
 
-    // Ensure session exists in D1
+    // Ensure session exists in D1 asynchronously
     if (env.DB) {
       const sessionManager = new SessionManager(env.DB);
       ctx.waitUntil(
@@ -285,18 +284,31 @@ async function handleDurableObjectRequest(
       );
     }
 
-    // Handle WebSocket via fetch (WebSockets can't be passed over RPC)
+    // When forwarding to the DO stub, always create a new Request and inject X-Session-ID
+    const makeForwardedRequest = (orig: Request): Request => {
+      // Copy the original request into a new Request object; this allows header mutation.
+      const forwarded = new Request(orig);
+      forwarded.headers.set('X-Session-ID', sessionId);
+      return forwarded;
+    };
+
+    // Handle WebSocket via fetch (forwarded request will contain X-Session-ID header)
     if (path === '/api/ws' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-      return await stub.fetch(request);
+      const forwarded = makeForwardedRequest(request);
+      return await stub.fetch(forwarded);
     }
 
-    // Route RPC calls
+    // For other RPC routes, forward the request as well (so DO can read session id and headers)
+    // We use direct stub RPC for some endpoints below (via stub.handleChat etc.) — keep as-is for RPC.
+    // But if you prefer HTTP-only to DO, you can forward fetch like above.
+
     switch (path) {
       case '/api/chat':
         if (request.method === 'POST') {
           const body = (await request.json()) as { message: string };
           const message = body.message?.trim();
           if (!message) throw new Error('Missing message');
+          // Use RPC call (preferred)
           const res = await stub.handleChat(message);
           return jsonResponse(res);
         }
