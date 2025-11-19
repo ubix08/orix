@@ -1,4 +1,4 @@
-/*  Orion-Chat — Fixed with proper session management  */
+/*  Orion-Chat — Enhanced with proper session management, auto-titling, and deletion  */
 
 /* ---------- 0. Tiny helpers ---------- */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -46,6 +46,7 @@ let isProcessing = false,
   currentMessageEl = null;
 let pendingFiles = [],
   conversationStarted = false;
+let isNewSession = false;
 const MAX_RECONNECT_DELAY = 30000;
 
 // Session management state
@@ -123,6 +124,8 @@ async function createNewSession(title = 'New Session') {
 
     console.log('Created new session:', currentSessionId);
 
+    isNewSession = true;
+
     // Update UI
     updateUserInfo();
 
@@ -161,13 +164,23 @@ function renderSessionsList() {
   container.innerHTML = '';
 
   sessions.forEach((session) => {
+    const id = session.sessionId || session.id;
+    const title = session.title || session.name || id;
     const li = document.createElement('li');
     li.className = `p-2 text-sm rounded-lg hover:bg-gray-800 transition-colors cursor-pointer truncate ${
-      session.sessionId === currentSessionId ? 'bg-gray-800 text-white' : 'text-gray-400'
+      id === currentSessionId ? 'bg-gray-800 text-white' : 'text-gray-400'
     }`;
-    li.textContent = session.title || session.name || session.sessionId;
-    li.title = session.title || session.sessionId;
-    li.onclick = () => switchToSession(session.sessionId || session.id);
+    li.innerHTML = `
+      <div class="flex items-center gap-2">
+        <span class="truncate flex-1">${title}</span>
+        <button onclick="deleteSession('${id}')" class="text-red-400 hover:text-red-300">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+          </svg>
+        </button>
+      </div>
+    `;
+    li.addEventListener('click', () => switchToSession(id));
     container.appendChild(li);
   });
 }
@@ -203,6 +216,57 @@ async function switchToSession(sessionId) {
   if (window.innerWidth <= 768 && sidebar && overlay) {
     sidebar.classList.add('-translate-x-full');
     overlay.classList.add('hidden');
+  }
+}
+
+window.deleteSession = async function (id) {
+  event.stopPropagation();
+  if (!confirm('Delete this session? This action cannot be undone.')) return;
+
+  try {
+    const response = await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
+    if (!response.ok) throw new Error('Failed to delete session');
+
+    if (id === currentSessionId) {
+      await createNewSession();
+    }
+
+    await loadSessionsList();
+    addToast('Session deleted', 'success');
+  } catch (e) {
+    console.error('Failed to delete session:', e);
+    addToast('Failed to delete session', 'error');
+  }
+};
+
+async function generateSessionTitle() {
+  try {
+    const response = await fetch(`/api/memory/summarize?session_id=${encodeURIComponent(currentSessionId)}`, {
+      method: 'POST',
+    });
+    if (!response.ok) throw new Error('Failed to summarize session');
+
+    const data = await response.json();
+    const title = data.summary.slice(0, 50) + (data.summary.length > 50 ? '...' : '');
+
+    await updateSessionTitle(title);
+  } catch (e) {
+    console.error('Failed to generate title:', e);
+  }
+}
+
+async function updateSessionTitle(title) {
+  try {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!response.ok) throw new Error('Failed to update title');
+
+    await loadSessionsList();
+  } catch (e) {
+    console.error('Failed to update title:', e);
   }
 }
 
@@ -508,6 +572,10 @@ function handleServerMessage(d) {
       scrollToBottom(true);
       pendingFiles = [];
       if (filePreview) filePreview.innerHTML = '';
+      if (isNewSession) {
+        isNewSession = false;
+        generateSessionTitle();
+      }
       break;
 
     case 'continuing':
