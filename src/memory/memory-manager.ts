@@ -1,6 +1,9 @@
 // ============================================================
-// FIXED: memory-manager.ts - Add content to metadata
+// FILE 1: src/memory/memory-manager.ts
+// CRITICAL FIX: Store content in metadata
 // ============================================================
+
+// Replace the saveMemory method (around line 55) with this:
 
 async saveMemory(item: MemoryItem): Promise<void> {
   if (!this.vectorize) {
@@ -11,7 +14,7 @@ async saveMemory(item: MemoryItem): Promise<void> {
   try {
     const embedding = await this.generateEmbedding(item.content);
 
-    // FIX: Store content in metadata so it can be retrieved
+    // FIXED: Store content in metadata so it can be retrieved
     await this.vectorize.upsert([
       {
         id: item.id,
@@ -19,7 +22,7 @@ async saveMemory(item: MemoryItem): Promise<void> {
         metadata: {
           ...item.metadata,
           type: 'short_term',
-          content: item.content, // ← ADD THIS
+          content: item.content, // ← CRITICAL: Add this line
         },
       },
     ]);
@@ -31,81 +34,68 @@ async saveMemory(item: MemoryItem): Promise<void> {
 }
 
 // ============================================================
-// FIXED: durable-agent.ts - Save every message to memory
+// FILE 2: src/services/message-service.ts
+// CRITICAL FIX: Always save to memory
 // ============================================================
 
-private async processWebSocketMessage(userMsg: string, ws: WebSocket | null): Promise<void> {
-  if (!this.messageService) {
-    console.warn('[DurableAgent] MessageService not initialized, attempting final init');
-    await this.init();
+// Replace the saveMessage method (around line 31) with this:
+
+async saveMessage(
+  role: 'user' | 'model',
+  content: string,
+  metadata?: {
+    toolCalls?: any[];
+    importance?: number;
+    tags?: string[];
+  }
+): Promise<void> {
+  const timestamp = Date.now();
+  const parts = [{ text: content }];
+
+  // 1. Save to Durable Object storage (instant)
+  await this.storage.saveMessage(role, parts, timestamp);
+
+  // 2. Add to pending D1 flush queue
+  const message: Message = {
+    role,
+    parts,
+    timestamp,
+    ...(metadata?.toolCalls && { toolCalls: metadata.toolCalls }),
+  };
+  this.pendingFlush.push(message);
+
+  // 3. FIXED: Always save to vector memory if available
+  if (this.memory && content.trim()) {
+    try {
+      await this.memory.saveMemory({
+        id: `${this.sessionId}_${timestamp}_${role}`,
+        content,
+        metadata: {
+          sessionId: this.sessionId,
+          timestamp,
+          role,
+          importance: metadata?.importance ?? (role === 'user' ? 0.8 : 0.7),
+          tags: metadata?.tags,
+        },
+      });
+      console.log(`[MessageService] Saved ${role} message to vector memory`);
+    } catch (error) {
+      console.error('[MessageService] Memory save failed:', error);
+      // Non-critical, continue
+    }
   }
 
-  if (!this.messageService) {
-    throw new Error('MessageService not initialized');
-  }
-
-  await this.storage.withTransaction(async (state) => {
-    state.lastActivityAt = Date.now();
-
-    // Save user message (this will save to memory via MessageService)
-    await this.messageService!.saveMessage('user', userMsg);
-    
-    // FIX: Also explicitly save to memory if MessageService doesn't have memory
-    if (this.memory && !this.messageService!['memory']) {
-      await this.saveMessageToMemory('user', userMsg);
-    }
-
-    // Check for cached response
-    const cachedResult = await this.checkCachedResponse(userMsg);
-    if (cachedResult.useCached && cachedResult.response) {
-      const words = cachedResult.response.split(' ');
-      for (const word of words) {
-        this.send(ws, { type: 'chunk', content: word + ' ' });
-        await new Promise((r) => setTimeout(r, 10));
-      }
-
-      await this.messageService!.saveMessage('model', cachedResult.response);
-      
-      // FIX: Save to memory
-      if (this.memory && !this.messageService!['memory']) {
-        await this.saveMessageToMemory('model', cachedResult.response);
-      }
-      
-      this.send(ws, { type: 'complete', response: cachedResult.response });
-      return;
-    }
-
-    ws && this.send(ws, { type: 'status', message: 'Searching memory...' });
-    const memoryContext = await this.buildMemoryContext(userMsg);
-
-    const response = await this.executeReactLoop(
-      userMsg,
-      this.storage.getMessages(),
-      state,
-      memoryContext,
-      {
-        onChunk: (chunk) => ws && this.send(ws, { type: 'chunk', content: chunk }),
-        onStatus: (status) => ws && this.send(ws, { type: 'status', message: status }),
-        onToolUse: (tools) => ws && this.send(ws, { type: 'tool_use', tools }),
-      }
-    );
-
-    // Save model response
-    await this.messageService!.saveMessage('model', response);
-    
-    // FIX: Save to memory
-    if (this.memory && !this.messageService!['memory']) {
-      await this.saveMessageToMemory('model', response);
-    }
-
-    ws && this.send(ws, { type: 'complete', response });
-
-    // Create LTM summary if needed
-    await this.maybeCreateLTM(this.storage.getMessages(), userMsg, response);
-  });
+  // 4. Schedule batch flush to D1
+  this.scheduleFlush();
 }
 
-// NEW: Helper method to save messages to memory
+// ============================================================
+// FILE 3: src/durable-agent.ts
+// CRITICAL FIXES: Multiple improvements
+// ============================================================
+
+// ADD this new method after the constructor (around line 100):
+
 private async saveMessageToMemory(role: 'user' | 'model', content: string): Promise<void> {
   if (!this.memory || !this.sessionId) return;
   
@@ -125,9 +115,7 @@ private async saveMessageToMemory(role: 'user' | 'model', content: string): Prom
   }
 }
 
-// ============================================================
-// FIXED: Load D1 history into memory on hydration
-// ============================================================
+// REPLACE the loadFromD1 method (around line 500) with this:
 
 private async loadFromD1(sessionId: string): Promise<void> {
   if (!this.d1) return;
@@ -136,11 +124,11 @@ private async loadFromD1(sessionId: string): Promise<void> {
     const messages = await this.d1.loadMessages(sessionId, 200);
     console.log(`[DurableAgent] Loaded ${messages.length} messages from D1`);
 
-    // Load into storage
+    // Load into storage AND memory
     for (const msg of messages) {
       await this.storage.saveMessage(msg.role as any, msg.parts, msg.timestamp);
       
-      // FIX: Also load into vector memory
+      // FIXED: Also load into vector memory
       if (this.memory) {
         const content = msg.parts
           ?.map((p: any) => (typeof p === 'string' ? p : p.text))
@@ -153,87 +141,13 @@ private async loadFromD1(sessionId: string): Promise<void> {
     }
 
     await this.d1.updateSessionActivity(sessionId);
+    console.log(`[DurableAgent] Loaded ${messages.length} messages into memory`);
   } catch (err) {
     console.error('[DurableAgent] D1 load failed:', err);
   }
 }
 
-// ============================================================
-// FIXED: MessageService should always use memory if available
-// ============================================================
-
-// message-service.ts changes:
-export class MessageService {
-  private storage: DurableStorage;
-  private memory?: MemoryManager;
-  private sessionId: string;
-  private pendingFlush: Message[] = [];
-  private flushScheduled = false;
-  private d1FlushHandler?: (messages: Message[]) => Promise<void>;
-
-  constructor(
-    storage: DurableStorage,
-    sessionId: string,
-    memory?: MemoryManager
-  ) {
-    this.storage = storage;
-    this.sessionId = sessionId;
-    this.memory = memory;
-  }
-
-  async saveMessage(
-    role: 'user' | 'model',
-    content: string,
-    metadata?: {
-      toolCalls?: any[];
-      importance?: number;
-      tags?: string[];
-    }
-  ): Promise<void> {
-    const timestamp = Date.now();
-    const parts = [{ text: content }];
-
-    // 1. Save to Durable Object storage (instant)
-    await this.storage.saveMessage(role, parts, timestamp);
-
-    // 2. Add to pending D1 flush queue
-    const message: Message = {
-      role,
-      parts,
-      timestamp,
-      ...(metadata?.toolCalls && { toolCalls: metadata.toolCalls }),
-    };
-    this.pendingFlush.push(message);
-
-    // 3. FIX: Always save to vector memory if available
-    if (this.memory && content.trim()) {
-      try {
-        await this.memory.saveMemory({
-          id: `${this.sessionId}_${timestamp}_${role}`,
-          content,
-          metadata: {
-            sessionId: this.sessionId,
-            timestamp,
-            role,
-            importance: metadata?.importance ?? (role === 'user' ? 0.8 : 0.7),
-            tags: metadata?.tags,
-          },
-        });
-        console.log(`[MessageService] Saved ${role} message to vector memory`);
-      } catch (error) {
-        console.error('[MessageService] Memory save failed:', error);
-        // Non-critical, continue
-      }
-    }
-
-    // 4. Schedule batch flush to D1
-    this.scheduleFlush();
-  }
-}
-
-// ============================================================
-// FIXED: Reduce LTM threshold for more frequent summaries
-// ============================================================
+// REPLACE the maybeCreateLTM method (around line 570) with this:
 
 private async maybeCreateLTM(
   history: Message[],
@@ -242,7 +156,7 @@ private async maybeCreateLTM(
 ): Promise<void> {
   if (!this.memory || !this.sessionId) return;
   
-  // FIX: Create summaries every 5-10 messages instead of 15
+  // FIXED: Create summaries every 10 messages instead of 15
   if (history.length === 0 || history.length % 10 !== 0) return;
 
   try {
@@ -278,37 +192,113 @@ private async maybeCreateLTM(
   }
 }
 
-// ============================================================
-// TESTING: Verify memory is working
-// ============================================================
+// ADD this diagnostic method at the end of the class (before the closing brace):
 
-// Add this diagnostic method to durable-agent.ts:
 public async debugMemory(): Promise<{
   stmCount: number;
   ltmCount: number;
   recentMemories: any[];
   searchTest: any[];
 }> {
+  await this.init();
+  
   if (!this.memory) {
-    return { stmCount: 0, ltmCount: 0, recentMemories: [], searchTest: [] };
+    return { 
+      stmCount: 0, 
+      ltmCount: 0, 
+      recentMemories: [], 
+      searchTest: [] 
+    };
   }
 
-  const stats = await this.memory.getMemoryStats();
-  const recent = await this.memory.getRecentMemories(5);
-  const searchTest = await this.memory.searchMemory('test query', { topK: 3 });
+  try {
+    const stats = await this.memory.getMemoryStats();
+    const recent = await this.memory.getRecentMemories(5);
+    const searchTest = await this.memory.searchMemory('test', { topK: 3 });
 
-  return {
-    stmCount: stats.sessionMemories,
-    ltmCount: stats.longTermMemories,
-    recentMemories: recent,
-    searchTest,
-  };
+    return {
+      stmCount: stats.sessionMemories,
+      ltmCount: stats.longTermMemories,
+      recentMemories: recent,
+      searchTest,
+    };
+  } catch (error) {
+    console.error('[DurableAgent] debugMemory failed:', error);
+    return { 
+      stmCount: 0, 
+      ltmCount: 0, 
+      recentMemories: [], 
+      searchTest: [] 
+    };
+  }
 }
 
-// Add route in index.ts:
+// ============================================================
+// FILE 4: src/index.ts
+// ADD new debug route
+// ============================================================
+
+// Add this case in the handleDurableObjectRequest switch statement:
+
 case '/api/debug/memory':
   if (request.method === 'GET') {
     const res = await stub.debugMemory();
     return jsonResponse(res);
   }
   break;
+
+// ============================================================
+// STEP-BY-STEP APPLICATION GUIDE
+// ============================================================
+
+/*
+1. Open src/memory/memory-manager.ts
+   - Find the saveMemory method (line ~55)
+   - Add this line inside the metadata object:
+     content: item.content,
+
+2. Open src/services/message-service.ts
+   - Find the saveMessage method (line ~31)
+   - Update the vector memory save section to always save
+   - Add console.log for verification
+
+3. Open src/durable-agent.ts
+   - Add the new saveMessageToMemory helper method
+   - Update loadFromD1 to save messages to memory
+   - Update maybeCreateLTM to run every 10 messages (not 15)
+   - Add debugMemory method at the end
+
+4. Open src/index.ts
+   - Add the /api/debug/memory route in the switch statement
+
+5. Deploy and test:
+   - wrangler deploy
+   - Test with curl or your frontend
+*/
+
+// ============================================================
+// TESTING COMMANDS
+// ============================================================
+
+/*
+# Test 1: Check memory initialization
+curl "https://your-worker.dev/api/debug/memory?session_id=test-123"
+
+# Test 2: Send a message
+curl -X POST "https://your-worker.dev/api/chat?session_id=test-123" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "My name is Alice and I love pizza"}'
+
+# Test 3: Check memory was saved
+curl "https://your-worker.dev/api/debug/memory?session_id=test-123"
+
+# Test 4: Ask follow-up question
+curl -X POST "https://your-worker.dev/api/chat?session_id=test-123" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What do I love to eat?"}'
+
+# Test 5: Search memory directly
+curl -X POST "https://your-worker.dev/api/memory/search?session_id=test-123" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "food preferences", "topK": 5}'
+*/
