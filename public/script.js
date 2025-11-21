@@ -1,4 +1,4 @@
-/*  Orion-Chat — Enhanced with proper session management, auto-titling, and deletion  */
+/*  Orion-Chat — FIXED: Session management, history loading, WebSocket URL  */
 
 /* ---------- 0. Tiny helpers ---------- */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -75,7 +75,7 @@ window.addEventListener('beforeunload', () => {
   if (ws) try { ws.close(); } catch {}
 });
 
-/* ---------- 5. Session Management ---------- */
+/* ---------- 5. Session Management (FIXED) ---------- */
 async function initializeSession() {
   // Try to get session ID from localStorage
   const storedSessionId = localStorage.getItem('currentSessionId');
@@ -85,12 +85,17 @@ async function initializeSession() {
     try {
       const response = await fetch(`/api/sessions/${storedSessionId}`);
       if (response.ok) {
-        currentSessionId = storedSessionId;
-        console.log('Restored session:', currentSessionId);
-        await loadChatHistory();
-        connectWebSocket();
-        updateUserInfo();
-        return;
+        const session = await response.json();
+        // ✅ FIXED: Handle all possible response formats
+        currentSessionId = session.sessionId || session.session_id || session.id;
+        
+        if (currentSessionId) {
+          console.log('Restored session:', currentSessionId);
+          await loadChatHistory();
+          connectWebSocket();
+          updateUserInfo();
+          return;
+        }
       }
     } catch (e) {
       console.log('Failed to restore session, creating new one', e);
@@ -114,10 +119,14 @@ async function createNewSession(title = 'New Session') {
     }
 
     const session = await response.json();
-    // depending on SessionManager implementation, session.sessionId or id may be used
-    currentSessionId = session.sessionId || session.id || session.session_id;
+    
+    // ✅ FIXED: Normalize session ID extraction
+    currentSessionId = session.sessionId || session.session_id || session.id;
 
-    if (!currentSessionId) throw new Error('Missing session id in response');
+    if (!currentSessionId) {
+      console.error('Session response:', session);
+      throw new Error('Missing session id in response');
+    }
 
     // Save to localStorage
     localStorage.setItem('currentSessionId', currentSessionId);
@@ -164,23 +173,28 @@ function renderSessionsList() {
   container.innerHTML = '';
 
   sessions.forEach((session) => {
-    const id = session.sessionId || session.id;
-    const title = session.title || session.name || id;
+    // ✅ FIXED: Normalize ID extraction
+    const id = session.sessionId || session.session_id || session.id;
+    const title = session.title || session.name || id.slice(0, 8);
+    
     const li = document.createElement('li');
     li.className = `p-2 text-sm rounded-lg hover:bg-gray-800 transition-colors cursor-pointer truncate ${
       id === currentSessionId ? 'bg-gray-800 text-white' : 'text-gray-400'
     }`;
     li.innerHTML = `
       <div class="flex items-center gap-2">
-        <span class="truncate flex-1">${title}</span>
-        <button onclick="deleteSession('${id}')" class="text-red-400 hover:text-red-300">
+        <span class="truncate flex-1">${escapeHtml(title)}</span>
+        <button onclick="deleteSession('${id}', event)" class="text-red-400 hover:text-red-300">
           <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
             <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
           </svg>
         </button>
       </div>
     `;
-    li.addEventListener('click', () => switchToSession(id));
+    
+    // ✅ FIXED: Only switch session on text click, not button
+    li.querySelector('span').addEventListener('click', () => switchToSession(id));
+    
     container.appendChild(li);
   });
 }
@@ -219,8 +233,12 @@ async function switchToSession(sessionId) {
   }
 }
 
-window.deleteSession = async function (id) {
-  event.stopPropagation();
+window.deleteSession = async function (id, event) {
+  if (event) {
+    event.stopPropagation();
+    event.preventDefault();
+  }
+  
   if (!confirm('Delete this session? This action cannot be undone.')) return;
 
   try {
@@ -240,14 +258,20 @@ window.deleteSession = async function (id) {
 };
 
 async function generateSessionTitle() {
+  if (!currentSessionId) return;
+  
   try {
     const response = await fetch(`/api/memory/summarize?session_id=${encodeURIComponent(currentSessionId)}`, {
       method: 'POST',
     });
-    if (!response.ok) throw new Error('Failed to summarize session');
+    
+    if (!response.ok) {
+      console.warn('Failed to generate title, using default');
+      return;
+    }
 
     const data = await response.json();
-    const title = data.summary.slice(0, 50) + (data.summary.length > 50 ? '...' : '');
+    const title = (data.summary || 'Chat Session').slice(0, 50) + (data.summary && data.summary.length > 50 ? '...' : '');
 
     await updateSessionTitle(title);
   } catch (e) {
@@ -256,12 +280,15 @@ async function generateSessionTitle() {
 }
 
 async function updateSessionTitle(title) {
+  if (!currentSessionId) return;
+  
   try {
     const response = await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}`, {
-      method: 'PUT',
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
     });
+    
     if (!response.ok) throw new Error('Failed to update title');
 
     await loadSessionsList();
@@ -272,7 +299,7 @@ async function updateSessionTitle(title) {
 
 function updateUserInfo() {
   if (userInfo && currentSessionId) {
-    userInfo.textContent = `Session: ${currentSessionId.slice(0, 8)}...`;
+    userInfo.textContent = `Session: ${currentSessionId.slice(0, 12)}...`;
   }
 }
 
@@ -294,7 +321,7 @@ function configureMarked() {
   });
 }
 
-/* ---------- 7. WebSocket with session support ---------- */
+/* ---------- 7. WebSocket (FIXED URL) ---------- */
 async function connectWebSocket() {
   if (!currentSessionId) {
     console.error('Cannot connect WebSocket without session ID');
@@ -306,9 +333,11 @@ async function connectWebSocket() {
   isConnecting = true;
   updateConnectionStatus('Connecting…', 'bg-gray-500');
 
-  // Build URL using location.origin (keeps protocol + host + port)
-  const origin = location.origin.replace(/^http/, 'ws'); // ws:// or wss://
-  const url = `${origin.replace(/^http/, 'ws')}/api/ws?session_id=${encodeURIComponent(currentSessionId)}`;
+  // ✅ FIXED: Correct URL construction (no double replacement)
+  const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${wsProtocol}//${location.host}/api/ws?session_id=${encodeURIComponent(currentSessionId)}`;
+
+  console.log('Connecting to:', url);
 
   try {
     ws = new WebSocket(url);
@@ -323,11 +352,13 @@ async function connectWebSocket() {
     isConnecting = false;
     reconnectAttempts = 0;
     updateConnectionStatus('Connected', 'bg-teal-500');
+    console.log('WebSocket connected');
   };
 
   ws.onclose = () => {
     isConnecting = false;
     updateConnectionStatus('Disconnected', 'bg-red-500');
+    console.log('WebSocket closed');
     scheduleReconnect();
   };
 
@@ -347,8 +378,8 @@ async function connectWebSocket() {
 
 function scheduleReconnect() {
   const delay = Math.min(1000 * Math.pow(2, reconnectAttempts++), MAX_RECONNECT_DELAY);
+  console.log(`Reconnecting in ${delay}ms...`);
   setTimeout(() => {
-    // reconnect only if there's still a session
     if (currentSessionId) connectWebSocket();
   }, delay);
 }
@@ -380,7 +411,7 @@ function setupFileUpload() {
   if (attachBtn) {
     attachBtn.addEventListener('click', () => {
       fileInput?.click();
-      $('tools-popup')?.classList.add('pointer-events-none');
+      $('tools-popup')?.classList.add('pointer-events-none', 'opacity-0', 'translate-y-2');
     });
   }
 
@@ -388,7 +419,7 @@ function setupFileUpload() {
     const files = Array.from(e.target.files || []);
     for (const file of files) {
       if (file.size > 20 * 1024 * 1024) {
-        addToast(`${file.name} too large`, 'error');
+        addToast(`${file.name} too large (max 20MB)`, 'error');
         continue;
       }
       try {
@@ -434,7 +465,6 @@ function addFileChip(file) {
     </button>`;
   filePreview.appendChild(chip);
 
-  // Attach remove handler
   const btn = chip.querySelector('button');
   btn?.addEventListener('click', () => removeFileChip(file.name));
 }
@@ -472,6 +502,13 @@ function setupInputHandlers() {
       userInput.style.height = 'auto';
       userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
     });
+    
+    userInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
   }
 
   if (form) {
@@ -498,7 +535,7 @@ function setupInputHandlers() {
   }
 }
 
-/* ---------- 11. Send with session ID ---------- */
+/* ---------- 11. Send ---------- */
 async function sendMessage() {
   const msg = (userInput?.value || '').trim();
   if ((msg === '' && pendingFiles.length === 0) || isProcessing) return;
@@ -522,8 +559,10 @@ async function sendMessage() {
   disableInput();
   hideWelcome();
   addUserMessage(msg || 'Sent files for analysis.');
-  if (userInput) userInput.value = '';
-  if (userInput) userInput.style.height = 'auto';
+  if (userInput) {
+    userInput.value = '';
+    userInput.style.height = 'auto';
+  }
   showTypingIndicator('Processing…');
 
   try {
@@ -544,6 +583,8 @@ async function sendMessage() {
 
 /* ---------- 12. Server messages ---------- */
 function handleServerMessage(d) {
+  console.log('Server message:', d.type);
+  
   switch (d.type) {
     case 'status':
       updateTypingIndicator(d.message);
@@ -572,9 +613,11 @@ function handleServerMessage(d) {
       scrollToBottom(true);
       pendingFiles = [];
       if (filePreview) filePreview.innerHTML = '';
+      
+      // Generate title for new sessions after first exchange
       if (isNewSession) {
         isNewSession = false;
-        generateSessionTitle();
+        setTimeout(() => generateSessionTitle(), 1000);
       }
       break;
 
@@ -590,6 +633,10 @@ function handleServerMessage(d) {
       enableInput(true);
       break;
 
+    case 'session_context':
+      console.log('Session context:', d.context);
+      break;
+
     default:
       console.warn('Unknown server message', d);
       break;
@@ -603,7 +650,7 @@ function showToolUse(tools) {
   }
   const div = document.createElement('div');
   div.className = 'text-xs text-gray-400 mt-2 p-2 bg-white/5 rounded border border-white/10';
-  div.innerHTML = `🔧 Using: **${tools.join(', ')}**`;
+  div.textContent = `🔧 Using: ${tools.join(', ')}`;
   currentMessageEl.querySelector('.message-content')?.appendChild(div);
   scrollToBottom(true);
 }
@@ -669,14 +716,14 @@ function addAssistantMessage(txt, scroll = true) {
 /* ---------- 14. Typing ---------- */
 function showTypingIndicator(msg = 'Thinking…') {
   if (!typingText || !typingIndicator) return;
-  typingText.innerHTML = `<div class="flex items-center gap-2"><span>${msg}</span></div>`;
+  typingText.innerHTML = `<div class="flex items-center gap-2"><span>${escapeHtml(msg)}</span></div>`;
   typingIndicator.classList.remove('hidden');
   scrollToBottom(true);
 }
 
 function updateTypingIndicator(msg) {
   if (!typingText) return;
-  typingText.innerHTML = `<div class="flex items-center gap-2"><span>${msg}</span></div>`;
+  typingText.innerHTML = `<div class="flex items-center gap-2"><span>${escapeHtml(msg)}</span></div>`;
 }
 
 function hideTypingIndicator() {
@@ -743,37 +790,56 @@ function addToast(msg, type = 'info') {
   }, 3000);
 }
 
-/* ---------- 19. History with session ID ---------- */
+/* ---------- 19. History (FIXED) ---------- */
 async function loadChatHistory() {
   if (!currentSessionId) return;
 
   try {
     const response = await fetch(`/api/history?session_id=${encodeURIComponent(currentSessionId)}`);
-    if (!response.ok) return;
+    if (!response.ok) {
+      console.warn('Failed to load history:', response.status);
+      return;
+    }
 
     const data = await response.json();
+    
     if (data.messages?.length) {
       hideWelcome();
+      
       data.messages.forEach((m) => {
         const role = m.role === 'model' ? 'assistant' : 'user';
-        const text = (m.parts || []).filter((p) => p.text).map((p) => p.text).join('\n');
+        
+        // ✅ FIXED: Handle different message formats
+        let text = '';
+        if (typeof m.content === 'string') {
+          text = m.content;
+        } else if (Array.isArray(m.parts)) {
+          text = m.parts
+            .filter((p) => p && (typeof p === 'string' || p.text))
+            .map((p) => (typeof p === 'string' ? p : p.text))
+            .join('\n');
+        } else if (m.parts && typeof m.parts === 'object' && m.parts.text) {
+          text = m.parts.text;
+        }
+        
         if (text) {
           role === 'user' ? addUserMessage(text, false) : addAssistantMessage(text, false);
         }
       });
+      
       scrollToBottom(false);
+      console.log(`Loaded ${data.messages.length} messages`);
     }
   } catch (e) {
-    console.error('history', e);
+    console.error('Failed to load history:', e);
   }
 }
 
-/* ---------- 20. Clear with session ID ---------- */
+/* ---------- 20. Clear ---------- */
 window.clearChat = async function () {
   if (!confirm('Start a new chat? This will create a fresh session.')) return;
 
   try {
-    // Create a new session instead of clearing
     await createNewSession('New Chat');
 
     // Clear UI
@@ -787,38 +853,5 @@ window.clearChat = async function () {
 
     addToast('New chat started', 'success');
   } catch (e) {
-    console.error('clear', e);
+    console.error('clear error', e);
     addToast('Failed to start new chat', 'error');
-  }
-};
-
-/* ---------- 21. Suggestions ---------- */
-window.useSuggestion = function (el) {
-  if (!el) return;
-  const txt = el.textContent
-    .trim()
-    .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')
-    .replace(/[^\w\s\?]/g, '')
-    .trim();
-  if (userInput) userInput.value = txt;
-  if (userInput) {
-    userInput.style.height = 'auto';
-    userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
-    userInput.focus();
-  }
-};
-
-/* ---------- 22. Welcome ---------- */
-function hideWelcome() {
-  if (!conversationStarted) {
-    welcomeScreen?.classList.add('hidden');
-    conversationStarted = true;
-  }
-}
-
-/* ---------- 23. Geo stub ---------- */
-window.getCurrentPosition = async () => ({
-  lat: 0,
-  lon: 0,
-  addr: 'Earth',
-});
