@@ -1,4 +1,4 @@
-// src/durable-agent.ts - FIXED MEMORY INTEGRATION
+// src/durable-agent.ts - Updated with Task Orchestration Integration
 import { DurableObject } from "cloudflare:workers";
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import type { Env, Message } from './types';
@@ -10,6 +10,8 @@ import { MemoryManager } from './memory/memory-manager';
 import { MessageService } from './services/message-service';
 import { SessionManager } from './session/session-manager';
 import type { AgentConfig } from './agent-core';
+
+// ===== NEW: Import Orchestration System =====
 import {
   Orchestrator,
   type BoardStorage,
@@ -32,11 +34,9 @@ export class AutonomousAgent extends DurableObject {
   private memoryEnabled = true;
   private initialized = false;
   private maxTurns = 10;
-  private orchestrator?: Orchestrator;
 
-  // ✅ NEW: Memory auto-save interval (every 5 messages instead of 15)
-  private readonly MEMORY_SAVE_INTERVAL = 5;
-  private messagesSinceLastSave = 0;
+  // ===== NEW: Orchestrator instance =====
+  private orchestrator?: Orchestrator;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -68,7 +68,7 @@ export class AutonomousAgent extends DurableObject {
     this.agent = new Agent(this.gemini, config);
   }
 
-  // ===== Board Storage (unchanged) =====
+  // ===== NEW: Board Storage Implementation =====
   private createBoardStorage(): BoardStorage {
     const doState = this.storage.getDurableObjectState();
     return {
@@ -84,6 +84,7 @@ export class AutonomousAgent extends DurableObject {
         await doState.storage.put(`taskBoard:${board.sessionId}`, board);
       },
       deleteBoard: async (boardId: string): Promise<void> => {
+        // Find and delete by session
         if (this.sessionId) {
           await doState.storage.delete(`taskBoard:${this.sessionId}`);
         }
@@ -91,7 +92,7 @@ export class AutonomousAgent extends DurableObject {
     };
   }
 
-  // ===== FIXED INITIALIZATION =====
+  // Initialize the DO (idempotent)
   private async init(): Promise<void> {
     if (this.initialized) return;
 
@@ -99,11 +100,10 @@ export class AutonomousAgent extends DurableObject {
       console.warn('[DurableAgent] init called without sessionId');
     }
 
-    // ✅ FIXED: Initialize MemoryManager with GeminiClient, not API key
     if (this.sessionId && this.env.VECTORIZE && !this.memory) {
       this.memory = new MemoryManager(
         this.env.VECTORIZE,
-        this.gemini,  // ✅ Pass GeminiClient instance
+        this.env.GEMINI_API_KEY,
         this.sessionId,
         { longTermEnabled: true, ltmThreshold: 0.65 }
       );
@@ -123,6 +123,7 @@ export class AutonomousAgent extends DurableObject {
         console.log('[DurableAgent] MessageService connected to D1');
       }
 
+      // ===== NEW: Initialize Orchestrator =====
       this.orchestrator = new Orchestrator(
         this.gemini,
         this.createBoardStorage(),
@@ -151,7 +152,9 @@ export class AutonomousAgent extends DurableObject {
     this.initialized = true;
   }
 
-  // ===== FETCH (unchanged) =====
+  // =============================================================
+  // fetch entry — unchanged signature, enhanced routing
+  // =============================================================
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -187,6 +190,7 @@ export class AutonomousAgent extends DurableObject {
           }
           break;
 
+        // ===== NEW: Task management endpoints =====
         case '/api/tasks/status':
           if (request.method === 'GET') {
             const res = await this.getTaskStatus();
@@ -209,6 +213,7 @@ export class AutonomousAgent extends DurableObject {
           }
           break;
 
+        // Existing endpoints...
         case '/api/history':
           if (request.method === 'GET') {
             const res = await this.getHistory();
@@ -267,7 +272,9 @@ export class AutonomousAgent extends DurableObject {
     }
   }
 
-  // ===== WebSocket (unchanged) =====
+  // =============================================================
+  // WebSocket handling — enhanced with orchestration events
+  // =============================================================
   private handleWebSocketUpgrade(request: Request): Response {
     const pair = new WebSocketPair();
     const [client, server] = Array.from(pair) as [WebSocket, WebSocket];
@@ -296,17 +303,23 @@ export class AutonomousAgent extends DurableObject {
     };
 
     this.activeSockets.add(server);
+
+    // ===== NEW: Send session context on connect =====
     this.sendSessionGreeting(server);
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  // ===== NEW: Session greeting on WebSocket connect =====
   private async sendSessionGreeting(ws: WebSocket): Promise<void> {
     if (!this.orchestrator) return;
 
     try {
       const context = await this.orchestrator.getSessionContext();
-      this.send(ws, { type: 'session_context', context });
+      this.send(ws, {
+        type: 'session_context',
+        context,
+      });
     } catch (e) {
       console.error('[DurableAgent] Failed to send session greeting:', e);
     }
@@ -322,6 +335,7 @@ export class AutonomousAgent extends DurableObject {
       return this.send(ws, { type: 'error', error: 'Invalid JSON' });
     }
 
+    // ===== NEW: Handle different message types =====
     switch (payload.type) {
       case 'user_message':
         if (typeof payload.content !== 'string') {
@@ -332,6 +346,7 @@ export class AutonomousAgent extends DurableObject {
         break;
 
       case 'checkpoint_response':
+        // User responding to a checkpoint
         await this.handleCheckpointResponse(ws, payload.feedback, payload.approved ?? true);
         break;
 
@@ -341,6 +356,7 @@ export class AutonomousAgent extends DurableObject {
         break;
 
       default:
+        // Backward compatibility: treat as user message
         if (payload.content) {
           await this.processWebSocketMessage(payload.content, ws);
         } else {
@@ -349,7 +365,7 @@ export class AutonomousAgent extends DurableObject {
     }
   }
 
-  // ===== FIXED MESSAGE PROCESSING =====
+  // ===== UPDATED: Process message with orchestration =====
   private async processWebSocketMessage(userMsg: string, ws: WebSocket | null): Promise<void> {
     if (!this.messageService) {
       await this.init();
@@ -362,30 +378,14 @@ export class AutonomousAgent extends DurableObject {
     await this.storage.withTransaction(async (state) => {
       state.lastActivityAt = Date.now();
 
-      // ✅ Save user message + increment memory counter
+      // Save user message
       await this.messageService!.saveMessage('user', userMsg);
-      this.messagesSinceLastSave++;
 
-      // ✅ FIXED: Save to short-term memory immediately
-      if (this.memory) {
-        try {
-          await this.memory.saveMemory({
-            id: `stm_${this.sessionId}_${Date.now()}`,
-            content: `User: ${userMsg}`,
-            metadata: {
-              sessionId: this.sessionId!,
-              timestamp: Date.now(),
-              role: 'user',
-            },
-          });
-        } catch (error) {
-          console.error('[DurableAgent] Failed to save user message to memory:', error);
-        }
-      }
-
+      // ===== NEW: Check for active task board =====
       const sessionContext = await this.orchestrator!.getSessionContext();
       
       if (sessionContext.hasActiveBoard && sessionContext.suggestedAction === 'resume') {
+        // User might be providing feedback to resume
         const lowerMsg = userMsg.toLowerCase();
         if (lowerMsg.includes('continue') || lowerMsg.includes('yes') || lowerMsg.includes('proceed')) {
           await this.handleCheckpointResponse(ws, userMsg, true);
@@ -396,22 +396,29 @@ export class AutonomousAgent extends DurableObject {
           this.send(ws, { type: 'status', message: 'Task abandoned. How can I help you?' });
           return;
         }
+        // Otherwise, treat as new request (will ask about existing task)
       }
 
+      // ===== NEW: Evaluate complexity =====
       ws && this.send(ws, { type: 'status', message: 'Analyzing request...' });
       const complexity = await this.orchestrator!.evaluateComplexity(userMsg);
 
       if (!complexity.isComplex) {
+        // Simple query — use existing direct response path
         await this.handleSimpleQuery(userMsg, ws, state);
         return;
       }
 
+      // ===== NEW: Complex query — create and execute plan =====
       ws && this.send(ws, { type: 'status', message: `Planning ${complexity.estimatedTasks || 'multiple'} tasks...` });
 
+      // Setup event streaming
       this.orchestrator!.onEvent((event) => this.streamOrchestratorEvent(ws, event));
 
+      // Build memory context
       const memoryContext = await this.buildMemoryContext(userMsg);
 
+      // Create plan
       const board = await this.orchestrator!.createPlan(userMsg, userMsg, memoryContext);
       
       ws && this.send(ws, {
@@ -421,33 +428,32 @@ export class AutonomousAgent extends DurableObject {
         summary: `Created plan with ${board.tasks.length} tasks and ${board.totalCheckpoints} checkpoints.`,
       });
 
+      // Execute until first checkpoint
       const result = await this.orchestrator!.executeUntilCheckpoint();
 
+      // Handle result
       if (result.status === 'completed') {
         await this.messageService!.saveMessage('model', result.finalOutput || result.message);
-        this.messagesSinceLastSave++;
         ws && this.send(ws, { type: 'complete', response: result.finalOutput || result.message });
-        
-        // ✅ Save assistant response to memory
-        await this.saveAssistantMemory(result.finalOutput || '');
-        
-        // ✅ Trigger LTM save if needed
-        await this.autoSaveLTM();
+        await this.maybeCreateLTM(this.storage.getMessages(), userMsg, result.finalOutput || '');
       } else if (result.status === 'checkpoint') {
+        // Don't save partial response — wait for user
         ws && this.send(ws, {
           type: 'checkpoint',
           message: result.message,
           task: result.checkpointTask,
         });
       } else {
+        // Failed
         await this.messageService!.saveMessage('model', `Task failed: ${result.message}`);
         ws && this.send(ws, { type: 'error', error: result.message });
       }
     });
   }
 
-  // ===== SIMPLE QUERY HANDLER (FIXED) =====
+  // ===== NEW: Handle simple queries (existing logic extracted) =====
   private async handleSimpleQuery(userMsg: string, ws: WebSocket | null, state: any): Promise<void> {
+    // Check for cached response
     const cachedResult = await this.checkCachedResponse(userMsg);
     if (cachedResult.useCached && cachedResult.response) {
       const words = cachedResult.response.split(' ');
@@ -456,18 +462,15 @@ export class AutonomousAgent extends DurableObject {
         await new Promise((r) => setTimeout(r, 10));
       }
       await this.messageService!.saveMessage('model', cachedResult.response);
-      this.messagesSinceLastSave++;
       this.send(ws, { type: 'complete', response: cachedResult.response });
-      
-      // ✅ Save to memory
-      await this.saveAssistantMemory(cachedResult.response);
-      await this.autoSaveLTM();
       return;
     }
 
+    // Build memory context
     ws && this.send(ws, { type: 'status', message: 'Searching memory...' });
     const memoryContext = await this.buildMemoryContext(userMsg);
 
+    // Execute ReAct loop with streaming callbacks
     const response = await this.executeReactLoop(
       userMsg,
       this.storage.getMessages(),
@@ -481,98 +484,18 @@ export class AutonomousAgent extends DurableObject {
     );
 
     await this.messageService!.saveMessage('model', response);
-    this.messagesSinceLastSave++;
     ws && this.send(ws, { type: 'complete', response });
-    
-    // ✅ Save to memory
-    await this.saveAssistantMemory(response);
-    
-    // ✅ Auto-save LTM
-    await this.autoSaveLTM();
+    await this.maybeCreateLTM(this.storage.getMessages(), userMsg, response);
   }
 
-  // ===== NEW: MEMORY HELPERS =====
-
-  /**
-   * ✅ NEW: Save assistant response to short-term memory immediately
-   */
-  private async saveAssistantMemory(response: string): Promise<void> {
-    if (!this.memory || !response) return;
-
-    try {
-      await this.memory.saveMemory({
-        id: `stm_${this.sessionId}_${Date.now()}`,
-        content: `Assistant: ${response}`,
-        metadata: {
-          sessionId: this.sessionId!,
-          timestamp: Date.now(),
-          role: 'assistant',
-        },
-      });
-    } catch (error) {
-      console.error('[DurableAgent] Failed to save assistant memory:', error);
-    }
-  }
-
-  /**
-   * ✅ FIXED: Auto-save to long-term memory every N messages (configurable)
-   */
-  private async autoSaveLTM(): Promise<void> {
-    if (!this.memory || !this.sessionId) return;
-    
-    // ✅ Save every 5 messages instead of 15
-    if (this.messagesSinceLastSave < this.MEMORY_SAVE_INTERVAL) return;
-
-    try {
-      this.messagesSinceLastSave = 0;
-
-      const history = this.storage.getMessages();
-      const recentMessages = history.slice(-this.MEMORY_SAVE_INTERVAL).map((m) => ({
-        role: m.role,
-        content: m.parts?.map((p) => (typeof p === 'string' ? p : p.text)).join(' ') || '',
-      }));
-
-      if (recentMessages.length === 0) return;
-
-      const summary = await this.memory.summarizeConversation(recentMessages);
-      const topics = await this.memory.extractImportantTopics(summary);
-
-      const userQueries = recentMessages
-        .filter((m) => m.role === 'user')
-        .map((m) => m.content)
-        .join(' | ');
-
-      const lastResponse = recentMessages
-        .filter((m) => m.role === 'model')
-        .map((m) => m.content)
-        .pop() || '';
-
-      await this.memory.addLongTermMemory({
-        id: `ltm_${this.sessionId}_${Date.now()}`,
-        sessionId: this.sessionId,
-        query: userQueries,
-        summary,
-        importance: this.calculateImportance(summary, topics),
-        timestamp: Date.now(),
-        interactions: 1,
-        lastAccessed: Date.now(),
-        answer: lastResponse,
-        topics: topics.join(', '),
-      });
-
-      console.log('[DurableAgent] Auto-saved LTM with topics:', topics);
-    } catch (error) {
-      console.error('[DurableAgent] Auto-save LTM failed:', error);
-    }
-  }
-
-  // ===== CHECKPOINT HANDLING (unchanged) =====
+  // ===== NEW: Handle checkpoint response =====
   private async handleCheckpointResponse(ws: WebSocket | null, feedback: string, approved: boolean): Promise<void> {
     if (!this.orchestrator) {
       this.send(ws, { type: 'error', error: 'Orchestrator not initialized' });
       return;
     }
 
+    // Setup event streaming
     this.orchestrator.onEvent((event) => this.streamOrchestratorEvent(ws, event));
 
     const result = await this.orchestrator.resumeFromCheckpoint(feedback, approved);
@@ -591,6 +514,7 @@ export class AutonomousAgent extends DurableObject {
     }
   }
 
+  // ===== NEW: Stream orchestrator events to WebSocket =====
   private streamOrchestratorEvent(ws: WebSocket | null, event: OrchestratorEvent): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -637,12 +561,12 @@ export class AutonomousAgent extends DurableObject {
         break;
 
       default:
+        // Pass through other events
         this.send(ws, event);
     }
   }
 
-  // ===== PUBLIC RPC METHODS (unchanged) =====
-
+  // ===== NEW: Task status endpoint =====
   public async getTaskStatus(): Promise<object> {
     await this.init();
     if (!this.orchestrator) {
@@ -651,6 +575,7 @@ export class AutonomousAgent extends DurableObject {
     return this.orchestrator.getSessionContext();
   }
 
+  // ===== NEW: Resume tasks endpoint =====
   public async resumeTasks(feedback: string, approved: boolean): Promise<object> {
     await this.init();
     if (!this.orchestrator) {
@@ -658,6 +583,14 @@ export class AutonomousAgent extends DurableObject {
     }
     return this.orchestrator.resumeFromCheckpoint(feedback, approved);
   }
+
+  // =============================================================
+  // Existing methods (unchanged)
+  // =============================================================
+
+  
+  // RPC Methods for HTTP Endpoints (kept for Worker RPC usage)
+  // =============================================================
 
   public async handleChat(message: string): Promise<{ response: string }> {
     await this.init();
@@ -671,19 +604,21 @@ export class AutonomousAgent extends DurableObject {
     await this.storage.withTransaction(async (state) => {
       state.lastActivityAt = Date.now();
 
+      // Save user message
       await this.messageService!.saveMessage('user', message);
-      this.messagesSinceLastSave++;
 
+      // Check for cached response in LTM
       const cachedResult = await this.checkCachedResponse(message);
       if (cachedResult.useCached && cachedResult.response) {
         finalResponse = cachedResult.response;
         await this.messageService!.saveMessage('model', finalResponse);
-        this.messagesSinceLastSave++;
         return;
       }
 
+      // Build memory context
       const memoryContext = await this.buildMemoryContext(message);
 
+      // Execute ReAct loop
       finalResponse = await this.executeReactLoop(
         message,
         this.storage.getMessages(),
@@ -691,11 +626,11 @@ export class AutonomousAgent extends DurableObject {
         memoryContext
       );
 
+      // Save model response
       await this.messageService!.saveMessage('model', finalResponse);
-      this.messagesSinceLastSave++;
 
-      await this.saveAssistantMemory(finalResponse);
-      await this.autoSaveLTM();
+      // Create LTM summary if needed
+      await this.maybeCreateLTM(this.storage.getMessages(), message, finalResponse);
     });
 
     return { response: finalResponse };
@@ -717,8 +652,6 @@ export class AutonomousAgent extends DurableObject {
         await this.memory.clearSessionMemory();
       }
     }
-
-    this.messagesSinceLastSave = 0;
 
     return { ok: true };
   }
@@ -746,7 +679,6 @@ export class AutonomousAgent extends DurableObject {
       memoryStatus: {
         enabled: !!this.memory,
         vectorizeAvailable: !!this.env.VECTORIZE,
-        messagesSinceLastSave: this.messagesSinceLastSave,
       },
     };
   }
@@ -805,7 +737,10 @@ export class AutonomousAgent extends DurableObject {
     return { summary, topics };
   }
 
-  // ===== REACT LOOP (unchanged) =====
+  // =============================================================
+  // ReAct Loop (from Agent)
+  // =============================================================
+
   private async executeReactLoop(
     userMessage: string,
     history: Message[],
@@ -864,7 +799,9 @@ export class AutonomousAgent extends DurableObject {
     return fullResponse;
   }
 
-  // ===== MEMORY HELPERS =====
+  // =============================================================
+  // Memory helpers and LTM
+  // =============================================================
 
   private async checkCachedResponse(
     query: string
@@ -878,7 +815,7 @@ export class AutonomousAgent extends DurableObject {
         const storedAnswer = ltmResults[0].metadata?.answer;
         if (storedAnswer) {
           await this.memory.updateLongTermMemory({
-            id: ltmResults[0].id,
+            ...ltmResults[0].metadata,
             lastAccessed: Date.now(),
             interactions: (ltmResults[0].metadata.interactions || 0) + 1,
           });
@@ -914,6 +851,47 @@ export class AutonomousAgent extends DurableObject {
     }
   }
 
+  private async maybeCreateLTM(
+    history: Message[],
+    lastQuery: string,
+    lastResponse: string
+  ): Promise<void> {
+    if (!this.memory || !this.sessionId) return;
+    if (history.length === 0 || history.length % 15 !== 0) return;
+
+    try {
+      const messagesToSummarize = history.slice(-15).map((m) => ({
+        role: m.role,
+        content: m.parts?.map((p) => (typeof p === 'string' ? p : p.text)).join(' ') || '',
+      }));
+
+      const summary = await this.memory.summarizeConversation(messagesToSummarize);
+      const topics = await this.memory.extractImportantTopics(summary);
+
+      const userQueries = messagesToSummarize
+        .filter((m) => m.role === 'user')
+        .map((m) => m.content)
+        .join(' | ');
+
+      await this.memory.addLongTermMemory({
+        id: `ltm_${this.sessionId}_${Date.now()}`,
+        sessionId: this.sessionId,
+        query: userQueries || lastQuery,
+        summary,
+        importance: this.calculateImportance(summary, topics),
+        timestamp: Date.now(),
+        interactions: 1,
+        lastAccessed: Date.now(),
+        answer: lastResponse,
+        topics: topics.join(', '),
+      } as any);
+
+      console.log('[DurableAgent] Created LTM summary with topics:', topics);
+    } catch (error) {
+      console.error('[DurableAgent] Failed to create LTM:', error);
+    }
+  }
+
   private calculateImportance(summary: string, topics: string[]): number {
     let score = 0.5;
 
@@ -923,8 +901,19 @@ export class AutonomousAgent extends DurableObject {
     score += Math.min(topics.length * 0.05, 0.2);
 
     const importantKeywords = [
-      'error', 'bug', 'fix', 'solution', 'problem', 'deploy', 'production',
-      'critical', 'important', 'api', 'database', 'configuration', 'setup',
+      'error',
+      'bug',
+      'fix',
+      'solution',
+      'problem',
+      'deploy',
+      'production',
+      'critical',
+      'important',
+      'api',
+      'database',
+      'configuration',
+      'setup',
     ];
 
     const lowerSummary = summary.toLowerCase();
@@ -935,7 +924,9 @@ export class AutonomousAgent extends DurableObject {
     return Math.min(Math.max(score, 0.5), 1.0);
   }
 
-  // ===== D1 HELPERS =====
+  // =============================================================
+  // D1 Helpers
+  // =============================================================
 
   private async loadFromD1(sessionId: string): Promise<void> {
     if (!this.d1) return;
