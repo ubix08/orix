@@ -1,4 +1,4 @@
-/*  Orion-Chat — FIXED: Session management, history loading, WebSocket URL  */
+/*  Orion-Chat — Enhanced with orchestration support for multi-step tasks  */
 
 /* ---------- 0. Tiny helpers ---------- */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -38,7 +38,7 @@ const menuBtn = $('menu-btn');
 const overlay = $('overlay');
 const userInfo = $('user-info');
 
-/* ---------- 3. State with session management ---------- */
+/* ---------- 3. State with session and task management ---------- */
 let ws = null,
   isConnecting = false,
   reconnectAttempts = 0;
@@ -52,6 +52,10 @@ const MAX_RECONNECT_DELAY = 30000;
 // Session management state
 let currentSessionId = null;
 let sessions = [];
+
+// Task orchestration state
+let currentTaskBoard = null;
+let taskProgressEl = null;
 
 /* ---------- 4. Init ---------- */
 window.addEventListener('DOMContentLoaded', async () => {
@@ -75,7 +79,7 @@ window.addEventListener('beforeunload', () => {
   if (ws) try { ws.close(); } catch {}
 });
 
-/* ---------- 5. Session Management (FIXED) ---------- */
+/* ---------- 5. Session Management ---------- */
 async function initializeSession() {
   // Try to get session ID from localStorage
   const storedSessionId = localStorage.getItem('currentSessionId');
@@ -85,17 +89,12 @@ async function initializeSession() {
     try {
       const response = await fetch(`/api/sessions/${storedSessionId}`);
       if (response.ok) {
-        const session = await response.json();
-        // ✅ FIXED: Handle all possible response formats
-        currentSessionId = session.sessionId || session.session_id || session.id;
-        
-        if (currentSessionId) {
-          console.log('Restored session:', currentSessionId);
-          await loadChatHistory();
-          connectWebSocket();
-          updateUserInfo();
-          return;
-        }
+        currentSessionId = storedSessionId;
+        console.log('Restored session:', currentSessionId);
+        await loadChatHistory();
+        connectWebSocket();
+        updateUserInfo();
+        return;
       }
     } catch (e) {
       console.log('Failed to restore session, creating new one', e);
@@ -119,29 +118,16 @@ async function createNewSession(title = 'New Session') {
     }
 
     const session = await response.json();
-    
-    // ✅ FIXED: Normalize session ID extraction
-    currentSessionId = session.sessionId || session.session_id || session.id;
+    currentSessionId = session.sessionId || session.id || session.session_id;
 
-    if (!currentSessionId) {
-      console.error('Session response:', session);
-      throw new Error('Missing session id in response');
-    }
+    if (!currentSessionId) throw new Error('Missing session id in response');
 
-    // Save to localStorage
     localStorage.setItem('currentSessionId', currentSessionId);
-
     console.log('Created new session:', currentSessionId);
 
     isNewSession = true;
-
-    // Update UI
     updateUserInfo();
-
-    // Connect WebSocket
     connectWebSocket();
-
-    // Reload sessions list
     await loadSessionsList();
 
     return session;
@@ -173,28 +159,23 @@ function renderSessionsList() {
   container.innerHTML = '';
 
   sessions.forEach((session) => {
-    // ✅ FIXED: Normalize ID extraction
-    const id = session.sessionId || session.session_id || session.id;
-    const title = session.title || session.name || id.slice(0, 8);
-    
+    const id = session.sessionId || session.id;
+    const title = session.title || session.name || id;
     const li = document.createElement('li');
     li.className = `p-2 text-sm rounded-lg hover:bg-gray-800 transition-colors cursor-pointer truncate ${
       id === currentSessionId ? 'bg-gray-800 text-white' : 'text-gray-400'
     }`;
     li.innerHTML = `
       <div class="flex items-center gap-2">
-        <span class="truncate flex-1">${escapeHtml(title)}</span>
-        <button onclick="deleteSession('${id}', event)" class="text-red-400 hover:text-red-300">
+        <span class="truncate flex-1">${title}</span>
+        <button onclick="deleteSession('${id}')" class="text-red-400 hover:text-red-300">
           <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
             <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
           </svg>
         </button>
       </div>
     `;
-    
-    // ✅ FIXED: Only switch session on text click, not button
-    li.querySelector('span').addEventListener('click', () => switchToSession(id));
-    
+    li.addEventListener('click', () => switchToSession(id));
     container.appendChild(li);
   });
 }
@@ -202,43 +183,32 @@ function renderSessionsList() {
 async function switchToSession(sessionId) {
   if (sessionId === currentSessionId) return;
 
-  // Close current WebSocket
   if (ws) {
     try { ws.close(); } catch {}
     ws = null;
   }
 
-  // Clear current chat
   if (chatMessages) chatMessages.innerHTML = '';
   conversationStarted = false;
   welcomeScreen?.classList.remove('hidden');
+  currentTaskBoard = null;
+  taskProgressEl = null;
 
-  // Switch session
   currentSessionId = sessionId;
   localStorage.setItem('currentSessionId', sessionId);
 
-  // Update UI
   updateUserInfo();
-
-  // Load new session data
   await loadChatHistory();
-
-  // Connect WebSocket
   connectWebSocket();
 
-  // Close sidebar on mobile
   if (window.innerWidth <= 768 && sidebar && overlay) {
     sidebar.classList.add('-translate-x-full');
     overlay.classList.add('hidden');
   }
 }
 
-window.deleteSession = async function (id, event) {
-  if (event) {
-    event.stopPropagation();
-    event.preventDefault();
-  }
-  
+window.deleteSession = async function (id) {
+  event.stopPropagation();
   if (!confirm('Delete this session? This action cannot be undone.')) return;
 
   try {
@@ -258,20 +228,14 @@ window.deleteSession = async function (id, event) {
 };
 
 async function generateSessionTitle() {
-  if (!currentSessionId) return;
-  
   try {
     const response = await fetch(`/api/memory/summarize?session_id=${encodeURIComponent(currentSessionId)}`, {
       method: 'POST',
     });
-    
-    if (!response.ok) {
-      console.warn('Failed to generate title, using default');
-      return;
-    }
+    if (!response.ok) throw new Error('Failed to summarize session');
 
     const data = await response.json();
-    const title = (data.summary || 'Chat Session').slice(0, 50) + (data.summary && data.summary.length > 50 ? '...' : '');
+    const title = data.summary.slice(0, 50) + (data.summary.length > 50 ? '...' : '');
 
     await updateSessionTitle(title);
   } catch (e) {
@@ -280,15 +244,12 @@ async function generateSessionTitle() {
 }
 
 async function updateSessionTitle(title) {
-  if (!currentSessionId) return;
-  
   try {
     const response = await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
     });
-    
     if (!response.ok) throw new Error('Failed to update title');
 
     await loadSessionsList();
@@ -299,7 +260,7 @@ async function updateSessionTitle(title) {
 
 function updateUserInfo() {
   if (userInfo && currentSessionId) {
-    userInfo.textContent = `Session: ${currentSessionId.slice(0, 12)}...`;
+    userInfo.textContent = `Session: ${currentSessionId.slice(0, 8)}...`;
   }
 }
 
@@ -321,7 +282,7 @@ function configureMarked() {
   });
 }
 
-/* ---------- 7. WebSocket (FIXED URL) ---------- */
+/* ---------- 7. WebSocket with session support ---------- */
 async function connectWebSocket() {
   if (!currentSessionId) {
     console.error('Cannot connect WebSocket without session ID');
@@ -333,11 +294,8 @@ async function connectWebSocket() {
   isConnecting = true;
   updateConnectionStatus('Connecting…', 'bg-gray-500');
 
-  // ✅ FIXED: Correct URL construction (no double replacement)
-  const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = `${wsProtocol}//${location.host}/api/ws?session_id=${encodeURIComponent(currentSessionId)}`;
-
-  console.log('Connecting to:', url);
+  const origin = location.origin.replace(/^http/, 'ws');
+  const url = `${origin}/api/ws?session_id=${encodeURIComponent(currentSessionId)}`;
 
   try {
     ws = new WebSocket(url);
@@ -352,13 +310,11 @@ async function connectWebSocket() {
     isConnecting = false;
     reconnectAttempts = 0;
     updateConnectionStatus('Connected', 'bg-teal-500');
-    console.log('WebSocket connected');
   };
 
   ws.onclose = () => {
     isConnecting = false;
     updateConnectionStatus('Disconnected', 'bg-red-500');
-    console.log('WebSocket closed');
     scheduleReconnect();
   };
 
@@ -378,7 +334,6 @@ async function connectWebSocket() {
 
 function scheduleReconnect() {
   const delay = Math.min(1000 * Math.pow(2, reconnectAttempts++), MAX_RECONNECT_DELAY);
-  console.log(`Reconnecting in ${delay}ms...`);
   setTimeout(() => {
     if (currentSessionId) connectWebSocket();
   }, delay);
@@ -411,7 +366,7 @@ function setupFileUpload() {
   if (attachBtn) {
     attachBtn.addEventListener('click', () => {
       fileInput?.click();
-      $('tools-popup')?.classList.add('pointer-events-none', 'opacity-0', 'translate-y-2');
+      $('tools-popup')?.classList.add('pointer-events-none');
     });
   }
 
@@ -419,7 +374,7 @@ function setupFileUpload() {
     const files = Array.from(e.target.files || []);
     for (const file of files) {
       if (file.size > 20 * 1024 * 1024) {
-        addToast(`${file.name} too large (max 20MB)`, 'error');
+        addToast(`${file.name} too large`, 'error');
         continue;
       }
       try {
@@ -502,13 +457,6 @@ function setupInputHandlers() {
       userInput.style.height = 'auto';
       userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
     });
-    
-    userInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
-      }
-    });
   }
 
   if (form) {
@@ -535,7 +483,7 @@ function setupInputHandlers() {
   }
 }
 
-/* ---------- 11. Send ---------- */
+/* ---------- 11. Send with session ID ---------- */
 async function sendMessage() {
   const msg = (userInput?.value || '').trim();
   if ((msg === '' && pendingFiles.length === 0) || isProcessing) return;
@@ -559,10 +507,8 @@ async function sendMessage() {
   disableInput();
   hideWelcome();
   addUserMessage(msg || 'Sent files for analysis.');
-  if (userInput) {
-    userInput.value = '';
-    userInput.style.height = 'auto';
-  }
+  if (userInput) userInput.value = '';
+  if (userInput) userInput.style.height = 'auto';
   showTypingIndicator('Processing…');
 
   try {
@@ -581,10 +527,10 @@ async function sendMessage() {
   }
 }
 
-/* ---------- 12. Server messages ---------- */
+/* ---------- 12. Server messages with orchestration support ---------- */
 function handleServerMessage(d) {
   console.log('Server message:', d.type, d);
-  
+
   switch (d.type) {
     case 'status':
       updateTypingIndicator(d.message);
@@ -593,7 +539,6 @@ function handleServerMessage(d) {
     case 'chunk':
       if (!currentMessageEl) {
         hideWelcome();
-        hideTypingIndicator(); // ✅ Hide typing when first chunk arrives
         currentMessageEl = createMessageElement('assistant');
       }
       appendToMessage(currentMessageEl, d.content);
@@ -604,32 +549,51 @@ function handleServerMessage(d) {
       if (d.tools?.length) showToolUse(d.tools);
       break;
 
+    // ===== NEW: Orchestration messages =====
+    case 'plan_created':
+      handlePlanCreated(d);
+      break;
+
+    case 'task_progress':
+      handleTaskProgress(d);
+      break;
+
+    case 'task_completed':
+      handleTaskCompleted(d);
+      break;
+
+    case 'task_failed':
+      handleTaskFailed(d);
+      break;
+
+    case 'checkpoint':
+      handleCheckpoint(d);
+      break;
+
+    case 'task_abandoned':
+      handleTaskAbandoned();
+      break;
+
+    case 'session_context':
+      handleSessionContext(d.context);
+      break;
+    // ===== END NEW =====
+
     case 'done':
     case 'complete':
       hideTypingIndicator();
-      
-      // ✅ CRITICAL FIX: Handle complete without existing message element
-      if (!currentMessageEl && d.response) {
-        hideWelcome();
-        currentMessageEl = createMessageElement('assistant');
-        currentMessageEl.querySelector('.message-content').textContent = d.response;
-      }
-      
-      if (currentMessageEl) {
-        finalizeMessage(currentMessageEl);
-      }
-      
+      if (currentMessageEl) finalizeMessage(currentMessageEl);
       currentMessageEl = null;
+      taskProgressEl = null;
+      currentTaskBoard = null;
       isProcessing = false;
       enableInput(false);
       scrollToBottom(true);
       pendingFiles = [];
       if (filePreview) filePreview.innerHTML = '';
-      
-      // Generate title for new sessions after first exchange
       if (isNewSession) {
         isNewSession = false;
-        setTimeout(() => generateSessionTitle(), 1000);
+        generateSessionTitle();
       }
       break;
 
@@ -640,21 +604,205 @@ function handleServerMessage(d) {
     case 'error':
       hideTypingIndicator();
       addToast(`Error: ${d.error}`, 'error');
-      if (currentMessageEl) {
-        currentMessageEl.remove();
-      }
       currentMessageEl = null;
+      taskProgressEl = null;
       isProcessing = false;
       enableInput(true);
-      break;
-
-    case 'session_context':
-      console.log('Session context:', d.context);
       break;
 
     default:
       console.warn('Unknown server message type:', d.type, d);
       break;
+  }
+}
+
+/* ---------- 13. Task orchestration handlers ---------- */
+function handlePlanCreated(data) {
+  hideWelcome();
+  
+  currentTaskBoard = {
+    taskCount: data.taskCount || 0,
+    checkpoints: data.checkpoints || 0,
+    completedTasks: 0,
+  };
+
+  // Create a plan summary message
+  const planEl = createMessageElement('assistant');
+  const content = planEl.querySelector('.message-content');
+  
+  content.innerHTML = `
+    <div class="p-4 bg-blue-900/30 border border-blue-700/50 rounded-lg">
+      <div class="flex items-center gap-2 mb-2">
+        <svg class="w-5 h-5 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+        </svg>
+        <h4 class="font-semibold text-blue-400">Plan Created</h4>
+      </div>
+      <p class="text-sm text-gray-300">${data.summary || `Breaking down your request into ${data.taskCount} tasks with ${data.checkpoints} checkpoints.`}</p>
+      <div class="mt-3 flex gap-4 text-xs text-gray-400">
+        <span>📋 ${data.taskCount} tasks</span>
+        <span>🎯 ${data.checkpoints} checkpoints</span>
+      </div>
+    </div>
+  `;
+
+  // Create task progress container
+  taskProgressEl = document.createElement('div');
+  taskProgressEl.className = 'mt-4 space-y-2';
+  content.appendChild(taskProgressEl);
+
+  scrollToBottom(true);
+}
+
+function handleTaskProgress(data) {
+  if (!taskProgressEl) {
+    // Create progress container if it doesn't exist
+    if (!currentMessageEl) {
+      hideWelcome();
+      currentMessageEl = createMessageElement('assistant');
+    }
+    const content = currentMessageEl.querySelector('.message-content');
+    taskProgressEl = document.createElement('div');
+    taskProgressEl.className = 'mt-4 space-y-2';
+    content.appendChild(taskProgressEl);
+  }
+
+  // Update or create task progress item
+  let taskItem = taskProgressEl.querySelector(`[data-task-id="${data.taskId}"]`);
+  
+  if (!taskItem) {
+    taskItem = document.createElement('div');
+    taskItem.className = 'p-3 bg-white/5 rounded border border-white/10';
+    taskItem.dataset.taskId = data.taskId;
+    taskProgressEl.appendChild(taskItem);
+  }
+
+  taskItem.innerHTML = `
+    <div class="flex items-center gap-2">
+      <div class="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
+      <span class="text-sm text-gray-300">${escapeHtml(data.message)}</span>
+    </div>
+  `;
+
+  scrollToBottom(true);
+}
+
+function handleTaskCompleted(data) {
+  if (!taskProgressEl) return;
+
+  currentTaskBoard.completedTasks++;
+
+  const taskItem = taskProgressEl.querySelector(`[data-task-id="${data.taskId}"]`);
+  
+  if (taskItem) {
+    taskItem.innerHTML = `
+      <div class="flex items-center gap-2">
+        <div class="w-2 h-2 bg-teal-500 rounded-full"></div>
+        <span class="text-sm text-gray-300">✓ ${escapeHtml(data.taskName || 'Task completed')}</span>
+      </div>
+      ${data.preview ? `<p class="text-xs text-gray-400 mt-1 ml-4">${escapeHtml(data.preview)}</p>` : ''}
+    `;
+  }
+
+  updateTypingIndicator(`Progress: ${currentTaskBoard.completedTasks}/${currentTaskBoard.taskCount} tasks completed`);
+  scrollToBottom(true);
+}
+
+function handleTaskFailed(data) {
+  if (!taskProgressEl) return;
+
+  const taskItem = taskProgressEl.querySelector(`[data-task-id="${data.taskId}"]`);
+  
+  if (taskItem) {
+    taskItem.innerHTML = `
+      <div class="flex items-center gap-2">
+        <div class="w-2 h-2 bg-red-500 rounded-full"></div>
+        <span class="text-sm text-red-400">✗ Task failed${data.willRetry ? ' (retrying...)' : ''}</span>
+      </div>
+      ${data.error ? `<p class="text-xs text-gray-400 mt-1 ml-4">${escapeHtml(data.error)}</p>` : ''}
+    `;
+  }
+
+  scrollToBottom(true);
+}
+
+function handleCheckpoint(data) {
+  hideTypingIndicator();
+  
+  if (currentMessageEl) {
+    finalizeMessage(currentMessageEl);
+  }
+
+  // Create checkpoint message
+  const checkpointEl = createMessageElement('assistant');
+  const content = checkpointEl.querySelector('.message-content');
+  
+  content.innerHTML = `
+    <div class="p-4 bg-purple-900/30 border border-purple-700/50 rounded-lg">
+      <div class="flex items-center gap-2 mb-3">
+        <svg class="w-5 h-5 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <h4 class="font-semibold text-purple-400">Checkpoint Reached</h4>
+      </div>
+      <p class="text-sm text-gray-300 mb-4">${escapeHtml(data.message)}</p>
+      ${data.task ? `
+        <div class="mb-4 p-2 bg-white/5 rounded text-xs text-gray-400">
+          <strong>Current task:</strong> ${escapeHtml(data.task.name || 'Unknown')}
+        </div>
+      ` : ''}
+      <div class="flex gap-2">
+        <button onclick="respondToCheckpoint(true)" class="px-4 py-2 bg-teal-600 hover:bg-teal-700 rounded-lg text-sm transition-colors">
+          ✓ Continue
+        </button>
+        <button onclick="respondToCheckpoint(false)" class="px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-sm transition-colors">
+          ✗ Stop
+        </button>
+      </div>
+    </div>
+  `;
+
+  currentMessageEl = null;
+  taskProgressEl = null;
+  isProcessing = false;
+  enableInput(true);
+  scrollToBottom(true);
+}
+
+window.respondToCheckpoint = function(approved) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    addToast('Connection lost', 'error');
+    return;
+  }
+
+  const feedback = approved ? 'Continue with the plan' : 'Stop execution';
+  
+  isProcessing = true;
+  disableInput();
+  showTypingIndicator(approved ? 'Continuing...' : 'Stopping...');
+
+  ws.send(JSON.stringify({
+    type: 'checkpoint_response',
+    feedback,
+    approved,
+  }));
+};
+
+function handleTaskAbandoned() {
+  hideTypingIndicator();
+  currentTaskBoard = null;
+  taskProgressEl = null;
+  isProcessing = false;
+  enableInput(true);
+  addToast('Task abandoned', 'info');
+}
+
+function handleSessionContext(context) {
+  console.log('Session context:', context);
+  
+  if (context.hasActiveBoard && context.suggestedAction === 'resume') {
+    // Show notification about pending tasks
+    addToast('You have an unfinished task. Type "continue" to resume or "stop" to abandon.', 'info');
   }
 }
 
@@ -665,12 +813,12 @@ function showToolUse(tools) {
   }
   const div = document.createElement('div');
   div.className = 'text-xs text-gray-400 mt-2 p-2 bg-white/5 rounded border border-white/10';
-  div.textContent = `🔧 Using: ${tools.join(', ')}`;
+  div.innerHTML = `🔧 Using: **${tools.join(', ')}**`;
   currentMessageEl.querySelector('.message-content')?.appendChild(div);
   scrollToBottom(true);
 }
 
-/* ---------- 13. Message DOM ---------- */
+/* ---------- 14. Message DOM ---------- */
 function createMessageElement(role) {
   const isUser = role === 'user';
   const wrap = document.createElement('div');
@@ -728,25 +876,24 @@ function addAssistantMessage(txt, scroll = true) {
   if (scroll) scrollToBottom(false);
 }
 
-/* ---------- 14. Typing ---------- */
+/* ---------- 15. Typing ---------- */
 function showTypingIndicator(msg = 'Thinking…') {
   if (!typingText || !typingIndicator) return;
-  typingText.innerHTML = `<div class="flex items-center gap-2"><span>${escapeHtml(msg)}</span></div>`;
+  typingText.innerHTML = `<div class="flex items-center gap-2"><span>${msg}</span></div>`;
   typingIndicator.classList.remove('hidden');
   scrollToBottom(true);
 }
 
 function updateTypingIndicator(msg) {
   if (!typingText) return;
-  typingText.innerHTML = `<div class="flex items-center gap-2"><span>${escapeHtml(msg)}</span></div>`;
-  // Don't scroll on updates to avoid jumpiness
+  typingText.innerHTML = `<div class="flex items-center gap-2"><span>${msg}</span></div>`;
 }
 
 function hideTypingIndicator() {
   typingIndicator?.classList.add('hidden');
 }
 
-/* ---------- 15. Input lock ---------- */
+/* ---------- 16. Input lock ---------- */
 function disableInput() {
   if (userInput) userInput.disabled = true;
   if (sendButton) sendButton.disabled = true;
@@ -758,7 +905,7 @@ function enableInput(focus = true) {
   if (focus && userInput) userInput.focus();
 }
 
-/* ---------- 16. Scroll ---------- */
+/* ---------- 17. Scroll ---------- */
 function scrollToBottom(smooth = false) {
   const container = $('messages-area');
   if (container) {
@@ -769,7 +916,7 @@ function scrollToBottom(smooth = false) {
   }
 }
 
-/* ---------- 17. Connection status ---------- */
+/* ---------- 18. Connection status ---------- */
 function updateConnectionStatus(txt, cls) {
   const indicator = $('status-indicator');
   const statusText = $('status-text');
@@ -786,7 +933,7 @@ function updateConnectionStatus(txt, cls) {
   }
 }
 
-/* ---------- 18. Toast ---------- */
+/* ---------- 19. Toast ---------- */
 function addToast(msg, type = 'info') {
   const colors = {
     error: 'bg-red-600',
@@ -806,75 +953,55 @@ function addToast(msg, type = 'info') {
   }, 3000);
 }
 
-/* ---------- 19. History (FIXED) ---------- */
+/* ---------- 20. History with session ID ---------- */
 async function loadChatHistory() {
   if (!currentSessionId) return;
 
   try {
     const response = await fetch(`/api/history?session_id=${encodeURIComponent(currentSessionId)}`);
-    if (!response.ok) {
-      console.warn('Failed to load history:', response.status);
-      return;
-    }
+    if (!response.ok) return;
 
     const data = await response.json();
-    
     if (data.messages?.length) {
       hideWelcome();
-      
       data.messages.forEach((m) => {
         const role = m.role === 'model' ? 'assistant' : 'user';
-        
-        // ✅ FIXED: Handle different message formats
-        let text = '';
-        if (typeof m.content === 'string') {
-          text = m.content;
-        } else if (Array.isArray(m.parts)) {
-          text = m.parts
-            .filter((p) => p && (typeof p === 'string' || p.text))
-            .map((p) => (typeof p === 'string' ? p : p.text))
-            .join('\n');
-        } else if (m.parts && typeof m.parts === 'object' && m.parts.text) {
-          text = m.parts.text;
-        }
-        
+        const text = (m.parts || []).filter((p) => p.text).map((p) => p.text).join('\n');
         if (text) {
           role === 'user' ? addUserMessage(text, false) : addAssistantMessage(text, false);
         }
       });
-      
       scrollToBottom(false);
-      console.log(`Loaded ${data.messages.length} messages`);
     }
   } catch (e) {
-    console.error('Failed to load history:', e);
+    console.error('history', e);
   }
 }
 
-/* ---------- 20. Clear ---------- */
+/* ---------- 21. Clear with session ID ---------- */
 window.clearChat = async function () {
   if (!confirm('Start a new chat? This will create a fresh session.')) return;
 
   try {
     await createNewSession('New Chat');
 
-    // Clear UI
     if (chatMessages) chatMessages.innerHTML = '';
     pendingFiles = [];
     if (filePreview) filePreview.innerHTML = '';
     conversationStarted = false;
+    currentTaskBoard = null;
+    taskProgressEl = null;
 
-    // Show welcome screen
     welcomeScreen?.classList.remove('hidden');
 
     addToast('New chat started', 'success');
   } catch (e) {
-    console.error('clear error', e);
+    console.error('clear', e);
     addToast('Failed to start new chat', 'error');
   }
 };
 
-/* ---------- 21. Suggestions ---------- */
+/* ---------- 22. Suggestions ---------- */
 window.useSuggestion = function (el) {
   if (!el) return;
   const txt = el.textContent
@@ -882,18 +1009,25 @@ window.useSuggestion = function (el) {
     .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')
     .replace(/[^\w\s\?]/g, '')
     .trim();
+  if (userInput) userInput.value = txt;
   if (userInput) {
-    userInput.value = txt;
     userInput.style.height = 'auto';
     userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
     userInput.focus();
   }
 };
 
-/* ---------- 22. Welcome ---------- */
+/* ---------- 23. Welcome ---------- */
 function hideWelcome() {
   if (!conversationStarted) {
     welcomeScreen?.classList.add('hidden');
     conversationStarted = true;
   }
 }
+
+/* ---------- 24. Geo stub ---------- */
+window.getCurrentPosition = async () => ({
+  lat: 0,
+  lon: 0,
+  addr: 'Earth',
+});
