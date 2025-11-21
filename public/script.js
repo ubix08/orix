@@ -583,7 +583,7 @@ async function sendMessage() {
 
 /* ---------- 12. Server messages ---------- */
 function handleServerMessage(d) {
-  console.log('Server message:', d.type);
+  console.log('Server message:', d.type, d);
   
   switch (d.type) {
     case 'status':
@@ -593,6 +593,7 @@ function handleServerMessage(d) {
     case 'chunk':
       if (!currentMessageEl) {
         hideWelcome();
+        hideTypingIndicator(); // ✅ Hide typing when first chunk arrives
         currentMessageEl = createMessageElement('assistant');
       }
       appendToMessage(currentMessageEl, d.content);
@@ -606,7 +607,18 @@ function handleServerMessage(d) {
     case 'done':
     case 'complete':
       hideTypingIndicator();
-      if (currentMessageEl) finalizeMessage(currentMessageEl);
+      
+      // ✅ CRITICAL FIX: Handle complete without existing message element
+      if (!currentMessageEl && d.response) {
+        hideWelcome();
+        currentMessageEl = createMessageElement('assistant');
+        currentMessageEl.querySelector('.message-content').textContent = d.response;
+      }
+      
+      if (currentMessageEl) {
+        finalizeMessage(currentMessageEl);
+      }
+      
       currentMessageEl = null;
       isProcessing = false;
       enableInput(false);
@@ -628,6 +640,9 @@ function handleServerMessage(d) {
     case 'error':
       hideTypingIndicator();
       addToast(`Error: ${d.error}`, 'error');
+      if (currentMessageEl) {
+        currentMessageEl.remove();
+      }
       currentMessageEl = null;
       isProcessing = false;
       enableInput(true);
@@ -638,7 +653,7 @@ function handleServerMessage(d) {
       break;
 
     default:
-      console.warn('Unknown server message', d);
+      console.warn('Unknown server message type:', d.type, d);
       break;
   }
 }
@@ -724,6 +739,7 @@ function showTypingIndicator(msg = 'Thinking…') {
 function updateTypingIndicator(msg) {
   if (!typingText) return;
   typingText.innerHTML = `<div class="flex items-center gap-2"><span>${escapeHtml(msg)}</span></div>`;
+  // Don't scroll on updates to avoid jumpiness
 }
 
 function hideTypingIndicator() {
