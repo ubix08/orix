@@ -588,40 +588,26 @@ export class AutonomousAgent extends DurableObject {
   // Existing methods (unchanged)
   // =============================================================
 
+  
+  // RPC Methods for HTTP Endpoints (kept for Worker RPC usage)
+  // =============================================================
+
   public async handleChat(message: string): Promise<{ response: string }> {
     await this.init();
-    if (!this.messageService) throw new Error('MessageService not initialized');
+
+    if (!this.messageService) {
+      throw new Error('MessageService not initialized');
+    }
 
     let finalResponse = '';
 
     await this.storage.withTransaction(async (state) => {
       state.lastActivityAt = Date.now();
+
+      // Save user message
       await this.messageService!.saveMessage('user', message);
 
-      // Use orchestrator for complexity check
-      if (this.orchestrator) {
-        const complexity = await this.orchestrator.evaluateComplexity(message);
-        
-        if (complexity.isComplex) {
-          // For HTTP endpoint, we run synchronously until completion or checkpoint
-          const memoryContext = await this.buildMemoryContext(message);
-          await this.orchestrator.createPlan(message, message, memoryContext);
-          const result = await this.orchestrator.executeUntilCheckpoint();
-          
-          if (result.status === 'completed') {
-            finalResponse = result.finalOutput || result.message;
-          } else if (result.status === 'checkpoint') {
-            finalResponse = `${result.message}\n\n[Checkpoint reached - use /api/tasks/resume to continue]`;
-          } else {
-            finalResponse = `Task failed: ${result.message}`;
-          }
-          
-          await this.messageService!.saveMessage('model', finalResponse);
-          return;
-        }
-      }
-
-      // Simple query path
+      // Check for cached response in LTM
       const cachedResult = await this.checkCachedResponse(message);
       if (cachedResult.useCached && cachedResult.response) {
         finalResponse = cachedResult.response;
@@ -629,21 +615,27 @@ export class AutonomousAgent extends DurableObject {
         return;
       }
 
+      // Build memory context
       const memoryContext = await this.buildMemoryContext(message);
-      finalResponse = await this.executeReactLoop(message, this.storage.getMessages(), state, memoryContext);
+
+      // Execute ReAct loop
+      finalResponse = await this.executeReactLoop(
+        message,
+        this.storage.getMessages(),
+        state,
+        memoryContext
+      );
+
+      // Save model response
       await this.messageService!.saveMessage('model', finalResponse);
+
+      // Create LTM summary if needed
       await this.maybeCreateLTM(this.storage.getMessages(), message, finalResponse);
     });
 
     return { response: finalResponse };
   }
 
-  // ... rest of existing methods remain unchanged ...
-  // (getHistory, clearHistory, getStatus, syncToD1, searchMemory, getMemoryStats, 
-  //  summarizeSession, executeReactLoop, checkCachedResponse, buildMemoryContext,
-  //  maybeCreateLTM, calculateImportance, loadFromD1, send)
-
-  // Keeping method signatures for reference:
   public async getHistory(): Promise<{ messages: Message[] }> {
     await this.init();
     return { messages: this.storage.getMessages() };
@@ -651,14 +643,16 @@ export class AutonomousAgent extends DurableObject {
 
   public async clearHistory(): Promise<{ ok: boolean }> {
     await this.init();
+
     if (this.messageService) {
       await this.messageService.clear();
     } else {
       await this.storage.clearAll();
-      if (this.memory) await this.memory.clearSessionMemory();
+      if (this.memory) {
+        await this.memory.clearSessionMemory();
+      }
     }
-    // Also clear task board
-    await this.orchestrator?.clearBoard();
+
     return { ok: true };
   }
 
@@ -667,7 +661,6 @@ export class AutonomousAgent extends DurableObject {
     const storageStatus = this.storage.getStatus();
     const config = this.agent.getConfig();
     const circuit = this.gemini.getCircuitBreakerStatus?.() || { healthy: true };
-    const taskContext = this.orchestrator ? await this.orchestrator.getSessionContext() : null;
 
     return {
       ...storageStatus,
@@ -687,12 +680,270 @@ export class AutonomousAgent extends DurableObject {
         enabled: !!this.memory,
         vectorizeAvailable: !!this.env.VECTORIZE,
       },
-      // ===== NEW: Task status =====
-      taskStatus: taskContext,
     };
   }
 
-  // ... remaining existing methods (syncToD1, searchMemory, etc.) stay unchanged
+  public async syncToD1(): Promise<object> {
+    await this.init();
+
+    if (!this.messageService) {
+      throw new Error('MessageService not initialized');
+    }
+
+    await this.messageService.flush();
+    return { ok: true, sessionId: this.sessionId };
+  }
+
+  public async searchMemory(body: { query: string; topK?: number }): Promise<{ results: any[] }> {
+    await this.init();
+
+    if (!this.memory) {
+      throw new Error('Memory system not available');
+    }
+
+    const results = await this.memory.searchMemory(body.query, {
+      topK: body.topK || 10,
+    });
+
+    return { results };
+  }
+
+  public async getMemoryStats(): Promise<object> {
+    await this.init();
+
+    if (!this.memory) {
+      throw new Error('Memory system not available');
+    }
+
+    return await this.memory.getMemoryStats();
+  }
+
+  public async summarizeSession(): Promise<{ summary: string; topics: string[] }> {
+    await this.init();
+
+    if (!this.memory) {
+      throw new Error('Memory system not available');
+    }
+
+    const history = this.storage.getMessages();
+    const messages = history.map((m) => ({
+      role: m.role,
+      content: m.parts?.map((p) => (typeof p === 'string' ? p : p.text)).join(' ') || '',
+    }));
+
+    const summary = await this.memory.summarizeConversation(messages);
+    const topics = await this.memory.extractImportantTopics(summary);
+
+    return { summary, topics };
+  }
+
+  // =============================================================
+  // ReAct Loop (from Agent)
+  // =============================================================
+
+  private async executeReactLoop(
+    userMessage: string,
+    history: Message[],
+    state: any,
+    memoryContext?: string,
+    callbacks?: {
+      onChunk?: (chunk: string) => void;
+      onStatus?: (status: string) => void;
+      onToolUse?: (tools: string[]) => void;
+    }
+  ): Promise<string> {
+    const systemPrompt = this.agent.buildSystemPrompt(state, memoryContext);
+    let formattedHistory = this.agent.formatHistory(history, systemPrompt, userMessage);
+
+    let fullResponse = '';
+    let turn = 0;
+
+    while (turn < this.maxTurns) {
+      turn++;
+      callbacks?.onStatus?.(`Turn ${turn}/${this.maxTurns} | Reasoning...`);
+
+      const step = await this.agent.executeStep(formattedHistory, state, {
+        onChunk: callbacks?.onChunk,
+        onStatus: callbacks?.onStatus,
+        onError: (error) => console.error('[ReAct] Step error:', error),
+      });
+
+      fullResponse += step.text;
+
+      if (step.completed) {
+        console.log(`[ReAct] Completed in ${turn} turns`);
+        break;
+      }
+
+      callbacks?.onToolUse?.(step.toolCalls.map((t) => t.name));
+      const toolResults = await this.agent.executeTools(step.toolCalls, state);
+      const observationText = this.agent.formatToolResults(toolResults);
+
+      formattedHistory.push({
+        role: 'assistant',
+        content: step.text,
+        toolCalls: step.toolCalls,
+      });
+      formattedHistory.push({
+        role: 'user',
+        content: observationText,
+      });
+
+      callbacks?.onStatus?.(`Turn ${turn} completed, continuing...`);
+    }
+
+    if (turn >= this.maxTurns) {
+      console.warn('[ReAct] Max turns reached without completion');
+    }
+
+    return fullResponse;
+  }
+
+  // =============================================================
+  // Memory helpers and LTM
+  // =============================================================
+
+  private async checkCachedResponse(
+    query: string
+  ): Promise<{ useCached: boolean; response?: string }> {
+    if (!this.memory) return { useCached: false };
+
+    try {
+      const ltmResults = await this.memory.searchLongTermMemory(query, 1);
+
+      if (ltmResults.length > 0 && ltmResults[0].score >= 0.9) {
+        const storedAnswer = ltmResults[0].metadata?.answer;
+        if (storedAnswer) {
+          await this.memory.updateLongTermMemory({
+            ...ltmResults[0].metadata,
+            lastAccessed: Date.now(),
+            interactions: (ltmResults[0].metadata.interactions || 0) + 1,
+          });
+
+          return {
+            useCached: true,
+            response: `[Based on similar past query]\n\n${storedAnswer}`,
+          };
+        }
+      }
+    } catch (error) {
+      console.error('[DurableAgent] Cache check failed:', error);
+    }
+
+    return { useCached: false };
+  }
+
+  private async buildMemoryContext(query: string): Promise<string> {
+    if (!this.memory) return '';
+
+    try {
+      const memoryResult = await this.memory.buildEnhancedContext(query, undefined, {
+        includeSTM: true,
+        includeLTM: true,
+        maxSTMResults: 5,
+        maxLTMResults: 3,
+      });
+
+      return memoryResult.context;
+    } catch (error) {
+      console.error('[DurableAgent] Memory context building failed:', error);
+      return '';
+    }
+  }
+
+  private async maybeCreateLTM(
+    history: Message[],
+    lastQuery: string,
+    lastResponse: string
+  ): Promise<void> {
+    if (!this.memory || !this.sessionId) return;
+    if (history.length === 0 || history.length % 15 !== 0) return;
+
+    try {
+      const messagesToSummarize = history.slice(-15).map((m) => ({
+        role: m.role,
+        content: m.parts?.map((p) => (typeof p === 'string' ? p : p.text)).join(' ') || '',
+      }));
+
+      const summary = await this.memory.summarizeConversation(messagesToSummarize);
+      const topics = await this.memory.extractImportantTopics(summary);
+
+      const userQueries = messagesToSummarize
+        .filter((m) => m.role === 'user')
+        .map((m) => m.content)
+        .join(' | ');
+
+      await this.memory.addLongTermMemory({
+        id: `ltm_${this.sessionId}_${Date.now()}`,
+        sessionId: this.sessionId,
+        query: userQueries || lastQuery,
+        summary,
+        importance: this.calculateImportance(summary, topics),
+        timestamp: Date.now(),
+        interactions: 1,
+        lastAccessed: Date.now(),
+        answer: lastResponse,
+        topics: topics.join(', '),
+      } as any);
+
+      console.log('[DurableAgent] Created LTM summary with topics:', topics);
+    } catch (error) {
+      console.error('[DurableAgent] Failed to create LTM:', error);
+    }
+  }
+
+  private calculateImportance(summary: string, topics: string[]): number {
+    let score = 0.5;
+
+    if (summary.length > 500) score += 0.2;
+    else if (summary.length > 200) score += 0.1;
+
+    score += Math.min(topics.length * 0.05, 0.2);
+
+    const importantKeywords = [
+      'error',
+      'bug',
+      'fix',
+      'solution',
+      'problem',
+      'deploy',
+      'production',
+      'critical',
+      'important',
+      'api',
+      'database',
+      'configuration',
+      'setup',
+    ];
+
+    const lowerSummary = summary.toLowerCase();
+    const keywordMatches = importantKeywords.filter((kw) => lowerSummary.includes(kw)).length;
+
+    score += Math.min(keywordMatches * 0.05, 0.15);
+
+    return Math.min(Math.max(score, 0.5), 1.0);
+  }
+
+  // =============================================================
+  // D1 Helpers
+  // =============================================================
+
+  private async loadFromD1(sessionId: string): Promise<void> {
+    if (!this.d1) return;
+
+    try {
+      const messages = await this.d1.loadMessages(sessionId, 200);
+      console.log(`[DurableAgent] Loaded ${messages.length} messages from D1`);
+
+      for (const msg of messages) {
+        await this.storage.saveMessage(msg.role as any, msg.parts, msg.timestamp);
+      }
+
+      await this.d1.updateSessionActivity(sessionId);
+    } catch (err) {
+      console.error('[DurableAgent] D1 load failed:', err);
+    }
+  }
 
   private send(ws: WebSocket | null, data: unknown): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
