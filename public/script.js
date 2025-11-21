@@ -855,3 +855,29 @@ window.clearChat = async function () {
   } catch (e) {
     console.error('clear error', e);
     addToast('Failed to start new chat', 'error');
+  }
+};
+
+/* ---------- 21. Suggestions ---------- */
+window.useSuggestion = function (el) {
+  if (!el) return;
+  const txt = el.textContent
+    .trim()
+    .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')
+    .replace(/[^\w\s\?]/g, '')
+    .trim();
+  if (userInput) {
+    userInput.value = txt;
+    userInput.style.height = 'auto';
+    userInput.style.height = Math.min(userInput.scrollHeight, 200) + 'px';
+    userInput.focus();
+  }
+};
+
+/* ---------- 22. Welcome ---------- */
+function hideWelcome() {
+  if (!conversationStarted) {
+    welcomeScreen?.classList.add('hidden');
+    conversationStarted = true;
+  }
+}
