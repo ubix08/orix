@@ -3,13 +3,13 @@
 import { DurableObject } from "cloudflare:workers";
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import type { Env, Message } from './types';
-import { Agent, type StepResult, type StepCallbacks } from './agent-core';
+import { Agent, type StepResult, type StepCallbacks } from './agent-core-v2';
 import { DurableStorage } from './durable-storage';
 import { GeminiClient } from './gemini';
 import { D1Manager } from './storage/d1-manager';
 import { MemoryManager } from './memory/memory-manager';
 import { SessionManager } from './session/session-manager';
-import type { AgentConfig } from './agent-core';
+import type { AgentConfig } from './agent-core-v2';
 
 // NEW: Import optimization components
 import { initManager } from './core/initialization-manager';
