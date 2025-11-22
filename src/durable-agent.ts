@@ -7,7 +7,7 @@ import { Agent, type StepResult, type StepCallbacks } from './agent-core';
 import { DurableStorage } from './durable-storage';
 import { GeminiClient } from './gemini';
 import { D1Manager } from './storage/d1-manager';
-import { MemoryManager } from './memory/memory-manager-optimized';
+import { MemoryManagerOptimized } from './memory/memory-manager-optimized';
 import { SessionManager } from './session/session-manager';
 import type { AgentConfig } from './agent-core';
 
