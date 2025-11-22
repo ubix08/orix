@@ -116,7 +116,7 @@ export class PromptBuilder {
 }
 
 // ===== OPTIMIZED: Agent Core =====
-export class AgentV2 {
+export class Agent {
   private config: Required<AgentConfig>;
   private gemini: GeminiClient;
   private toolRegistry: ToolRegistry;
